@@ -1,4 +1,4 @@
-package ws_test
+package compat_test
 
 import (
 	"fmt"
@@ -6,13 +6,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zijiren233/gwst/ws"
+	"github.com/zijiren233/gwst/compat"
 )
 
 func TestGenerateSelfSignedCert(t *testing.T) {
 	host := "localhost"
 
-	cert, err := ws.GenerateSelfSignedCert(host)
+	cert, err := compat.GenerateSelfSignedCert(host)
 	if err != nil {
 		t.Fatalf("Failed to generate self-signed certificate: %v", err)
 	}
@@ -27,7 +27,7 @@ func TestGenerateSelfSignedCert(t *testing.T) {
 func TestGenerateSelfSignedCertWithECC(t *testing.T) {
 	host := "localhost"
 
-	cert, err := ws.GenerateSelfSignedCert(host, ws.WithECC())
+	cert, err := compat.GenerateSelfSignedCert(host, compat.WithECC())
 	if err != nil {
 		t.Fatalf("Failed to generate self-signed certificate: %v", err)
 	}
@@ -42,7 +42,7 @@ func TestGenerateSelfSignedCertWithECC(t *testing.T) {
 func TestGenerateSelfSignedCertWithEd25519(t *testing.T) {
 	host := "localhost"
 
-	cert, err := ws.GenerateSelfSignedCert(host, ws.WithEd25519())
+	cert, err := compat.GenerateSelfSignedCert(host, compat.WithEd25519())
 	if err != nil {
 		t.Fatalf("Failed to generate self-signed certificate: %v", err)
 	}
@@ -56,15 +56,15 @@ func TestGenerateSelfSignedCertWithEd25519(t *testing.T) {
 
 func TestWsServerAndDialer(t *testing.T) {
 	go func() {
-		wss := ws.NewServer(
+		wss := compat.NewServer(
 			"/ws",
-			ws.NewHandler(
-				ws.WithHandlerDefaultTargetAddr("127.0.0.1:8081"),
+			compat.NewHandler(
+				compat.WithHandlerDefaultTargetAddr("127.0.0.1:8081"),
 			),
-			ws.WithListenAddr("0.0.0.0:8080"),
-			ws.WithTLS("", ""),
-			ws.WithServerName("www.microstft.com"),
-			ws.WithSelfSignedCert(ws.WithECC()),
+			compat.WithListenAddr("0.0.0.0:8080"),
+			compat.WithTLS("", ""),
+			compat.WithServerName("www.microstft.com"),
+			compat.WithSelfSignedCert(compat.WithECC()),
 		)
 
 		err := wss.Serve()
@@ -126,12 +126,12 @@ func TestWsServerAndDialer(t *testing.T) {
 	time.Sleep(time.Second * 2)
 
 	go func() {
-		wsc := ws.NewDialer(
-			ws.WithAddr("127.0.0.1:8080"),
-			ws.WithPath("/ws"),
-			ws.WithDialTLS(true),
-			ws.WithDialServerName("www.microstft.com"),
-			ws.WithInsecure(true),
+		wsc := compat.NewDialer(
+			compat.WithAddr("127.0.0.1:8080"),
+			compat.WithPath("/ws"),
+			compat.WithDialTLS(true),
+			compat.WithDialServerName("www.microstft.com"),
+			compat.WithInsecure(true),
 		)
 
 		conn, err := wsc.DialTCP()
@@ -152,12 +152,12 @@ func TestWsServerAndDialer(t *testing.T) {
 		}
 	}()
 
-	wsc := ws.NewDialer(
-		ws.WithAddr("127.0.0.1:8080"),
-		ws.WithPath("/ws"),
-		ws.WithDialTLS(true),
-		ws.WithDialServerName("www.microstft.com"),
-		ws.WithInsecure(true),
+	wsc := compat.NewDialer(
+		compat.WithAddr("127.0.0.1:8080"),
+		compat.WithPath("/ws"),
+		compat.WithDialTLS(true),
+		compat.WithDialServerName("www.microstft.com"),
+		compat.WithInsecure(true),
 	)
 
 	conn, err := wsc.DialUDP()

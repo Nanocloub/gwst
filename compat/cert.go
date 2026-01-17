@@ -1,4 +1,4 @@
-package ws
+package compat
 
 import (
 	"bytes"

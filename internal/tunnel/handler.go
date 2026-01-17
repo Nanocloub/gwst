@@ -1,4 +1,4 @@
-package ws
+package tunnel
 
 import (
 	"context"
@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"golang.org/x/net/websocket"
+
+	"github.com/zijiren233/gwst/internal/transport"
 )
 
 const (
@@ -21,12 +23,27 @@ const (
 	DefaultUDPMaxEarlyDataSize    = 4 * 1024
 )
 
-type NamedTarget struct {
-	Addr          string
-	FallbackAddrs []string
-}
+// NamedTarget is an alias for transport.NamedTarget to unify the type definition
+type NamedTarget = transport.NamedTarget
 
 type GetTargetFunc func(req *http.Request) (string, []string, error)
+
+type Logger interface {
+	Infof(string, ...interface{})
+	Errorf(string, ...interface{})
+	Warnf(string, ...interface{})
+	Error(...interface{})
+}
+
+type CryptoManager interface {
+	Encrypt(plaintext []byte) ([]byte, error)
+	Decrypt(ciphertext []byte) ([]byte, error)
+}
+
+type deadlineWriter interface {
+	Write([]byte) (int, error)
+	SetWriteDeadline(time.Time) error
+}
 
 type Handler struct {
 	log                    Logger
@@ -36,6 +53,7 @@ type Handler struct {
 	wsServer               *websocket.Server
 	bufferPool             *sync.Pool
 	closeChan              chan struct{}
+	cryptoManager          CryptoManager
 	key                    string
 	udpEarlyDataHeaderName string
 	defaultTargetAddr      string
@@ -131,6 +149,12 @@ func WithHandlerKey(key string) HandlerOption {
 	}
 }
 
+func WithHandlerCryptoManager(cm CryptoManager) HandlerOption {
+	return func(h *Handler) {
+		h.cryptoManager = cm
+	}
+}
+
 func checkOrigin(config *websocket.Config, req *http.Request) (err error) {
 	config.Origin, err = websocket.Origin(config, req)
 	if err == nil && config.Origin == nil {
@@ -159,6 +183,39 @@ func newCheckOrigin(key string) func(config *websocket.Config, req *http.Request
 	}
 }
 
+func newSafeLogger(logger Logger) Logger {
+	if logger != nil {
+		return logger
+	}
+	return &nullLogger{}
+}
+
+type nullLogger struct{}
+
+func (n *nullLogger) Infof(string, ...interface{})  {}
+func (n *nullLogger) Errorf(string, ...interface{}) {}
+func (n *nullLogger) Warnf(string, ...interface{})  {}
+func (n *nullLogger) Error(...interface{})          {}
+
+func newBufferPool(size int) *sync.Pool {
+	const defaultBufferSize = 16 * 1024
+	if size == defaultBufferSize || size <= 0 {
+		return &sync.Pool{
+			New: func() any {
+				buffer := make([]byte, defaultBufferSize)
+				return &buffer
+			},
+		}
+	}
+
+	return &sync.Pool{
+		New: func() any {
+			buffer := make([]byte, size)
+			return &buffer
+		},
+	}
+}
+
 func NewHandler(opts ...HandlerOption) *Handler {
 	h := &Handler{
 		closeChan: make(chan struct{}),
@@ -168,8 +225,9 @@ func NewHandler(opts ...HandlerOption) *Handler {
 		opt(h)
 	}
 
+	const defaultBufferSize = 16 * 1024
 	if h.bufferSize == 0 {
-		h.bufferSize = DefaultBufferSize
+		h.bufferSize = defaultBufferSize
 	}
 
 	h.bufferPool = newBufferPool(h.bufferSize)
@@ -257,7 +315,7 @@ func (h *Handler) handleWebSocket(ws *websocket.Conn) {
 	)
 
 	if h.loadBalance {
-		target, fallbackAddrs = balanceTargets(target, fallbackAddrs)
+		target, fallbackAddrs = BalanceTargets(target, fallbackAddrs)
 	}
 
 	h.handle(ws, protocol, target, fallbackAddrs)
@@ -293,7 +351,7 @@ func (h *Handler) getTarget(req *http.Request) (string, []string, error) {
 	return "", nil, fmt.Errorf("target %s not allowed", requestTarget)
 }
 
-func balanceTargets(target string, fallbackAddrs []string) (string, []string) {
+func BalanceTargets(target string, fallbackAddrs []string) (string, []string) {
 	if len(fallbackAddrs) == 0 {
 		return target, fallbackAddrs
 	}
@@ -344,7 +402,7 @@ func (h *Handler) handle(ws *websocket.Conn, network, addr string, fallbackAddrs
 
 				return
 			case <-h.closeChan:
-				h.log.Info("Closing connection due to shutdown")
+			h.log.Infof("Closing connection due to shutdown")
 
 				_ = ws.Close()
 				return
@@ -420,13 +478,13 @@ func (h *Handler) handleUDP(ws *websocket.Conn, addr string, fallbackAddrs []str
 	go func() {
 		defer h.putBuffer(readBuffer)
 
-		if _, err := CopyBufferWithWriteTimeout(conn, ws, *readBuffer, DefaultWriteTimeout); err != nil &&
+		if _, err := copyBufferWithWriteTimeout(conn, ws, *readBuffer, 15*time.Second); err != nil &&
 			!errors.Is(err, net.ErrClosed) {
 			h.log.Infof("Failed to copy data to Target: %v", err)
 		}
 	}()
 
-	if _, err := CopyBufferWithWriteTimeout(ws, conn, *buffer, DefaultWriteTimeout); err != nil &&
+	if _, err := copyBufferWithWriteTimeout(ws, conn, *buffer, 15*time.Second); err != nil &&
 		!errors.Is(err, net.ErrClosed) {
 		h.log.Infof("Failed to copy data to WebSocket: %v", err)
 	}
@@ -444,7 +502,7 @@ func (h *Handler) handleNetwork(ws *websocket.Conn, network, addr string, fallba
 		buffer := h.getBuffer()
 		defer h.putBuffer(buffer)
 
-		if _, err := CopyBufferWithWriteTimeout(conn, ws, *buffer, DefaultWriteTimeout); err != nil &&
+		if _, err := h.copyWithEncryption(conn, ws, *buffer); err != nil &&
 			!errors.Is(err, net.ErrClosed) {
 			h.log.Infof("Failed to copy data to Target: %v", err)
 		}
@@ -453,7 +511,7 @@ func (h *Handler) handleNetwork(ws *websocket.Conn, network, addr string, fallba
 	buffer := h.getBuffer()
 	defer h.putBuffer(buffer)
 
-	if _, err := CopyBufferWithWriteTimeout(ws, conn, *buffer, DefaultWriteTimeout); err != nil &&
+	if _, err := h.copyWithDecryption(ws, conn, *buffer); err != nil &&
 		!errors.Is(err, net.ErrClosed) {
 		h.log.Infof("Failed to copy data to WebSocket: %v", err)
 	}
@@ -564,12 +622,7 @@ func (h *Handler) dialAndCheckUDP(
 	return buffer, rn, conn, nil
 }
 
-type deadlineWriter interface {
-	io.Writer
-	SetWriteDeadline(time.Time) error
-}
-
-func CopyBufferWithWriteTimeout(
+func copyBufferWithWriteTimeout(
 	dst deadlineWriter,
 	src io.Reader,
 	buf []byte,
@@ -616,6 +669,114 @@ func CopyBufferWithWriteTimeout(
 	return written, err
 }
 
+// copyWithEncryption copies data from src to dst, encrypting if crypto manager is available
+func (h *Handler) copyWithEncryption(dst deadlineWriter, src io.Reader, buf []byte) (written int64, err error) {
+	if h.cryptoManager == nil {
+		return copyBufferWithWriteTimeout(dst, src, buf, 15*time.Second)
+	}
+
+	for {
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			// Encrypt the data
+			encrypted, encErr := h.cryptoManager.Encrypt(buf[:nr])
+			if encErr != nil {
+				err = encErr
+				break
+			}
+
+			err = dst.SetWriteDeadline(time.Now().Add(15 * time.Second))
+			if err != nil {
+				break
+			}
+
+			nw, ew := dst.Write(encrypted)
+			if nw < 0 || len(encrypted) < nw {
+				nw = 0
+
+				if ew == nil {
+					ew = errors.New("invalid write result")
+				}
+			}
+
+			written += int64(nr)
+
+			if ew != nil {
+				err = ew
+				break
+			}
+
+			if len(encrypted) != nw {
+				err = io.ErrShortWrite
+				break
+			}
+		}
+
+		if er != nil {
+			if er != io.EOF {
+				err = er
+			}
+			break
+		}
+	}
+
+	return written, err
+}
+
+// copyWithDecryption copies data from src to dst, decrypting if crypto manager is available
+func (h *Handler) copyWithDecryption(dst deadlineWriter, src io.Reader, buf []byte) (written int64, err error) {
+	if h.cryptoManager == nil {
+		return copyBufferWithWriteTimeout(dst, src, buf, 15*time.Second)
+	}
+
+	for {
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			// Decrypt the data
+			decrypted, decErr := h.cryptoManager.Decrypt(buf[:nr])
+			if decErr != nil {
+				err = decErr
+				break
+			}
+
+			err = dst.SetWriteDeadline(time.Now().Add(15 * time.Second))
+			if err != nil {
+				break
+			}
+
+			nw, ew := dst.Write(decrypted)
+			if nw < 0 || len(decrypted) < nw {
+				nw = 0
+
+				if ew == nil {
+					ew = errors.New("invalid write result")
+				}
+			}
+
+			written += int64(nw)
+
+			if ew != nil {
+				err = ew
+				break
+			}
+
+			if len(decrypted) != nw {
+				err = io.ErrShortWrite
+				break
+			}
+		}
+
+		if er != nil {
+			if er != io.EOF {
+				err = er
+			}
+			break
+		}
+	}
+
+	return written, err
+}
+
 func (h *Handler) Close() {
 	h.closeOnce.Do(func() {
 		close(h.closeChan)
@@ -624,4 +785,8 @@ func (h *Handler) Close() {
 
 func (h *Handler) Wait() {
 	h.connectionsWg.Wait()
+}
+
+func stringToBytes(s string) []byte {
+	return []byte(s)
 }

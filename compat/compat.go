@@ -1,4 +1,4 @@
-package ws
+package compat
 
 import (
 	"context"
@@ -8,7 +8,61 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/zijiren233/gwst/internal/dialer"
+	"github.com/zijiren233/gwst/internal/tunnel"
 )
+
+// Re-export types from tunnel package for backward compatibility
+type Handler = tunnel.Handler
+type NamedTarget = tunnel.NamedTarget
+type GetTargetFunc = tunnel.GetTargetFunc
+type HandlerOption = tunnel.HandlerOption
+
+// Re-export types from dialer package for backward compatibility
+type Forwarder = dialer.Forwarder
+type ForwarderOption = dialer.ForwarderOption
+
+// Dialer type for backward compatibility with new Client
+// Note: This is defined in wsd.go, not an alias to dialer.Client
+
+// Re-export constructor functions
+var (
+	NewHandler                        = tunnel.NewHandler
+	WithHandlerLogger                 = tunnel.WithHandlerLogger
+	WithHandlerGetTargetFunc          = tunnel.WithHandlerGetTargetFunc
+	WithHandlerDefaultTargetAddr      = tunnel.WithHandlerDefaultTargetAddr
+	WithHandlerFallbackAddrs          = tunnel.WithHandlerFallbackAddrs
+	WithHandlerAllowedTargets         = tunnel.WithHandlerAllowedTargets
+	WithHandlerNamedTargets           = tunnel.WithHandlerNamedTargets
+	WithHandlerBufferSize             = tunnel.WithHandlerBufferSize
+	WithHandlerLoadBalance            = tunnel.WithHandlerLoadBalance
+	WithHandlerUDPDialReadTimeout     = tunnel.WithHandlerUDPDialReadTimeout
+	WithHandlerDisableTCPProtocol     = tunnel.WithHandlerDisableTCPProtocol
+	WithHandlerDisableUDPProtocol     = tunnel.WithHandlerDisableUDPProtocol
+	WithHandlerUDPEarlyDataHeaderName = tunnel.WithHandlerUDPEarlyDataHeaderName
+	WithHandlerKey                    = tunnel.WithHandlerKey
+	WithHandlerCryptoManager          = tunnel.WithHandlerCryptoManager
+	BalanceTargets                    = tunnel.BalanceTargets
+	
+	// Dialer package exports
+	NewForwarder              = dialer.NewForwarder
+	WithLogger                = dialer.WithLogger
+	WithDisableTCP            = dialer.WithDisableTCP
+	WithDisableUDP            = dialer.WithDisableUDP
+	WithUDPPool               = dialer.WithUDPPool
+	WithUDPPoolSize           = dialer.WithUDPPoolSize
+	WithUDPPoolPreAlloc       = dialer.WithUDPPoolPreAlloc
+	WithBufferSize            = dialer.WithBufferSize
+	WithUDPCleanupInterval    = dialer.WithUDPCleanupInterval
+	WithUDPIdleTimeout        = dialer.WithUDPIdleTimeout
+	WithDisableUDPEarlyData   = dialer.WithDisableUDPEarlyData
+	WithUDPEarlyDataHeaderName = dialer.WithUDPEarlyDataHeaderName
+	WithMaxEarlyDataSize      = dialer.WithMaxEarlyDataSize
+)
+
+// balanceTargets is an alias for backward compatibility
+var balanceTargets = BalanceTargets
 
 type Server struct {
 	listener              net.Listener

@@ -1,4 +1,4 @@
-package ws
+package compat
 
 import (
 	"context"
@@ -285,8 +285,11 @@ func connectConcurrent(
 	go func() {
 		wg.Wait()
 		close(results)
+	}()
+	
+	// Cleanup goroutine to close unused connections after context cancellation
+	go func() {
 		<-ctx.Done()
-
 		for res := range results {
 			if res.conn != nil {
 				res.conn.Close()
