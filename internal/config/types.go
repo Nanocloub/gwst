@@ -4,27 +4,70 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/zijiren233/gwst/internal/transport"
 	"gopkg.in/yaml.v3"
 )
+
+// NamedTarget 命名的目标地址配置
+type NamedTarget struct {
+	// 主地址
+	Addr string `yaml:"addr"`
+
+	// 回退地址列表
+	FallbackAddrs []string `yaml:"fallback_addrs"`
+}
+
+// TransportType 定义传输层类型
+type TransportType string
+
+const (
+	// TransportWebSocket WebSocket 传输
+	TransportWebSocket TransportType = "websocket"
+	// TransportTCP 直接 TCP 传输
+	TransportTCP TransportType = "tcp"
+	// TransportQUIC QUIC 传输
+	TransportQUIC TransportType = "quic"
+)
+
+// transportRegistry 传输注册表
+var transportRegistry = map[TransportType]struct{}{
+	TransportWebSocket: {},
+	TransportTCP:       {},
+	TransportQUIC:      {},
+}
+
+// IsValidTransport 检查传输类型是否有效
+func IsValidTransport(t TransportType) bool {
+	_, ok := transportRegistry[t]
+	return ok
+}
+
+// DefaultTransport 返回默认的传输类型
+func DefaultTransport() TransportType {
+	return TransportWebSocket
+}
+
+// IsValidTransportString 检查传输类型字符串是否有效
+func IsValidTransportString(s string) bool {
+	return IsValidTransport(TransportType(s))
+}
 
 // Endpoint 表示一个隧道端点配置
 type Endpoint struct {
 	// 基本配置
-	IsClient bool   `yaml:"is_client"`
+	IsClient   bool   `yaml:"is_client"`
 	ListenAddr string `yaml:"listen_addr"`
 	TargetAddr string `yaml:"target_addr"`
 
 	// 负载均衡
-	LoadBalance bool     `yaml:"load_balance"`
+	LoadBalance   bool     `yaml:"load_balance"`
 	FallbackAddrs []string `yaml:"fallback_addrs"`
 
 	// 目标地址管理
-	AllowedTargets map[string][]string `yaml:"allowed_targets"`
-	NamedTargets   map[string]transport.NamedTarget `yaml:"named_targets"`
+	AllowedTargets map[string][]string    `yaml:"allowed_targets"`
+	NamedTargets   map[string]NamedTarget `yaml:"named_targets"`
 
 	// 客户端目标选择
-	Target     string `yaml:"target"`
+	Target      string `yaml:"target"`
 	NamedTarget string `yaml:"named_target"`
 
 	// 协议和路径
@@ -88,7 +131,7 @@ func (e *Endpoint) Validate() error {
 	}
 
 	// 验证传输类型
-	if e.Transport != "" && !transport.IsValidTransportString(e.Transport) {
+	if e.Transport != "" && !IsValidTransportString(e.Transport) {
 		return fmt.Errorf("invalid transport type: %s", e.Transport)
 	}
 
@@ -105,7 +148,7 @@ func (e *Endpoint) Validate() error {
 // GetTransportType 获取传输类型，如果未指定则返回默认值
 func (e *Endpoint) GetTransportType() string {
 	if e.Transport == "" {
-		return string(transport.DefaultTransport())
+		return string(DefaultTransport())
 	}
 	return e.Transport
 }

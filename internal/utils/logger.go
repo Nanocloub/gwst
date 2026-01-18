@@ -1,4 +1,4 @@
-package util
+package utils
 
 // Logger 定义日志接口
 type Logger interface {
@@ -62,4 +62,23 @@ func (sl *SafeLogger) Errorf(format string, v ...any) {
 	if sl.logger != nil {
 		sl.logger.Errorf(format, v...)
 	}
+}
+
+// nullLogger 实现一个空的日志记录器，用于当没有提供 logger 时
+type nullLogger struct{}
+
+func (n *nullLogger) Info(...any)           {}
+func (n *nullLogger) Infof(string, ...any)  {}
+func (n *nullLogger) Warn(...any)           {}
+func (n *nullLogger) Warnf(string, ...any)  {}
+func (n *nullLogger) Error(...any)          {}
+func (n *nullLogger) Errorf(string, ...any) {}
+
+// NewSafeLoggerOrNull 创建一个安全的 logger，如果传入 nil 则返回 nullLogger
+// 这是一个便捷函数，避免在各处重复 nil 检查逻辑
+func NewSafeLoggerOrNull(logger Logger) Logger {
+	if logger != nil {
+		return logger
+	}
+	return &nullLogger{}
 }

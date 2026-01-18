@@ -14,16 +14,16 @@ import (
 
 // WebSocketServerTransport WebSocket 服务端传输实现
 type WebSocketServerTransport struct {
-	listener       net.Listener
-	listenErr      error
-	onListened     chan struct{}
-	shutdowned     chan struct{}
-	server         *http.Server
-	config         TransportServerConfig
-	handler        *websocket.Server
-	connectionWg   sync.WaitGroup
-	onListenOnce   sync.Once
-	shutdownOnce   sync.Once
+	listener     net.Listener
+	listenErr    error
+	onListened   chan struct{}
+	shutdowned   chan struct{}
+	server       *http.Server
+	config       TransportServerConfig
+	handler      *websocket.Server
+	connectionWg sync.WaitGroup
+	onListenOnce sync.Once
+	shutdownOnce sync.Once
 }
 
 // NewWebSocketServerTransport 创建 WebSocket 服务端传输
@@ -41,7 +41,7 @@ func NewWebSocketServerTransport(cfg TransportServerConfig) (*WebSocketServerTra
 	}
 
 	if cfg.Logger == nil {
-		cfg.Logger = newSafeLogger(nil)
+		cfg.Logger = NewSafeLoggerOrNull(nil)
 	}
 
 	wst := &WebSocketServerTransport{
@@ -226,7 +226,7 @@ func NewWebSocketClientTransport(cfg TransportClientConfig) (*WebSocketClientTra
 	}
 
 	if cfg.Logger == nil {
-		cfg.Logger = newSafeLogger(nil)
+		cfg.Logger = NewSafeLoggerOrNull(nil)
 	}
 
 	if cfg.Context == nil {

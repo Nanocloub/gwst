@@ -2,17 +2,18 @@ package transport
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"net"
 	"sync"
 	"time"
+
+	"github.com/quic-go/quic-go"
 )
 
 // QUICServerTransport QUIC 服务端传输实现
-// 注意：这是一个基础实现框架，实际使用需要集成具体的 QUIC 库
-// 推荐使用 github.com/quic-go/quic-go
 type QUICServerTransport struct {
-	listener     net.ListenConfig
+	listener     *quic.Listener
 	listenErr    error
 	onListened   chan struct{}
 	shutdowned   chan struct{}
@@ -20,7 +21,6 @@ type QUICServerTransport struct {
 	connectionWg sync.WaitGroup
 	onListenOnce sync.Once
 	shutdownOnce sync.Once
-	closeChan    chan struct{}
 }
 
 // NewQUICServerTransport 创建 QUIC 服务端传输
@@ -42,13 +42,12 @@ func NewQUICServerTransport(cfg TransportServerConfig) (*QUICServerTransport, er
 	}
 
 	if cfg.Logger == nil {
-		cfg.Logger = newSafeLogger(nil)
+		cfg.Logger = NewSafeLoggerOrNull(nil)
 	}
 
 	return &QUICServerTransport{
 		onListened: make(chan struct{}),
 		shutdowned: make(chan struct{}),
-		closeChan:  make(chan struct{}),
 		config:     cfg,
 	}, nil
 }
@@ -62,20 +61,73 @@ func (qst *QUICServerTransport) Serve() error {
 		close(qst.shutdowned)
 	})
 
-	// This is a placeholder implementation
-	// In production, use quic-go or similar library
-	// quic-go usage would look like:
-	// tlsConfig, err := getTLSConfig(qst.config.CertFile, qst.config.KeyFile)
-	// listener, err := quic.ListenAddr(qst.config.ListenAddr, tlsConfig, nil)
-	// etc.
+	// Load TLS certificate
+	cert, err := tls.LoadX509KeyPair(qst.config.CertFile, qst.config.KeyFile)
+	if err != nil {
+		qst.listenErr = err
+		return err
+	}
 
-	qst.config.Logger.Infof("QUIC server listening on %s (placeholder implementation)", qst.config.ListenAddr)
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"gwst-quic"},
+		MinVersion:   tls.VersionTLS13,
+	}
+
+	// Create QUIC listener
+	listener, err := quic.ListenAddr(qst.config.ListenAddr, tlsConfig, &quic.Config{
+		MaxIdleTimeout:  time.Minute * 5,
+		KeepAlivePeriod: time.Second * 30,
+	})
+	if err != nil {
+		qst.listenErr = err
+		return err
+	}
+
+	qst.listener = listener
+
 	qst.onListenOnce.Do(func() {
 		close(qst.onListened)
 	})
 
-	<-qst.closeChan
-	return nil
+	qst.config.Logger.Infof("QUIC server listening on %s", qst.config.ListenAddr)
+
+	// Accept connections
+	for {
+		conn, err := listener.Accept(context.Background())
+		if err != nil {
+			if errors.Is(err, quic.ErrServerClosed) {
+				return nil
+			}
+			qst.config.Logger.Errorf("Failed to accept QUIC connection: %v", err)
+			continue
+		}
+
+		qst.connectionWg.Add(1)
+		go qst.handleConnection(conn)
+	}
+}
+
+// handleConnection 处理单个 QUIC 连接
+func (qst *QUICServerTransport) handleConnection(conn *quic.Conn) {
+	defer qst.connectionWg.Done()
+	defer conn.CloseWithError(0, "connection closed")
+
+	// Accept streams
+	for {
+		stream, err := conn.AcceptStream(context.Background())
+		if err != nil {
+			return
+		}
+
+		// Handle each stream as a separate connection
+		go func(s *quic.Stream) {
+			defer s.Close()
+			if err := qst.config.Handler(&quicStreamWrapper{Stream: s}); err != nil {
+				qst.config.Logger.Infof("Stream handler error: %v", err)
+			}
+		}(stream)
+	}
 }
 
 // WaitListen 等待服务启动
@@ -92,7 +144,9 @@ func (qst *QUICServerTransport) WaitShutdown() <-chan struct{} {
 // Close 关闭 QUIC 服务
 func (qst *QUICServerTransport) Close() error {
 	qst.shutdownOnce.Do(func() {
-		close(qst.closeChan)
+		if qst.listener != nil {
+			qst.listener.Close()
+		}
 
 		// Wait for all connections to close
 		done := make(chan struct{})
@@ -115,7 +169,6 @@ func (qst *QUICServerTransport) Close() error {
 // QUICClientTransport QUIC 客户端传输实现
 type QUICClientTransport struct {
 	config TransportClientConfig
-	conn   net.Conn
 	mu     sync.Mutex
 	closed bool
 }
@@ -127,7 +180,7 @@ func NewQUICClientTransport(cfg TransportClientConfig) (*QUICClientTransport, er
 	}
 
 	if cfg.Logger == nil {
-		cfg.Logger = newSafeLogger(nil)
+		cfg.Logger = NewSafeLoggerOrNull(nil)
 	}
 
 	if cfg.Context == nil {
@@ -148,18 +201,33 @@ func (qct *QUICClientTransport) Dial(ctx context.Context) (net.Conn, error) {
 		return nil, net.ErrClosed
 	}
 
-	// This is a placeholder implementation
-	// In production, use quic-go or similar library
-	// quic-go usage would look like:
-	// tlsConfig := &tls.Config{
-	//     ServerName:         qct.config.ServerName,
-	//     InsecureSkipVerify: qct.config.Insecure,
-	//     MinVersion:         tls.VersionTLS13,
-	// }
-	// conn, err := quic.Dial(ctx, qct.config.RemoteAddr, tlsConfig, nil)
-	// etc.
+	tlsConfig := &tls.Config{
+		ServerName:         qct.config.ServerName,
+		InsecureSkipVerify: qct.config.Insecure,
+		NextProtos:         []string{"gwst-quic"},
+		MinVersion:         tls.VersionTLS13,
+	}
 
-	return nil, errors.New("QUIC transport is not fully implemented yet. Use quic-go library for production")
+	// Dial QUIC connection
+	conn, err := quic.DialAddr(ctx, qct.config.RemoteAddr, tlsConfig, &quic.Config{
+		MaxIdleTimeout:  time.Minute * 5,
+		KeepAlivePeriod: time.Second * 30,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Open a new stream
+	stream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		conn.CloseWithError(0, "failed to open stream")
+		return nil, err
+	}
+
+	return &quicStreamConn{
+		stream: stream,
+		conn:   conn,
+	}, nil
 }
 
 // Close 关闭 QUIC 连接
@@ -172,10 +240,83 @@ func (qct *QUICClientTransport) Close() error {
 	}
 
 	qct.closed = true
-
-	if qct.conn != nil {
-		return qct.conn.Close()
-	}
-
 	return nil
+}
+
+// quicStreamWrapper wraps a QUIC stream to implement net.Conn
+type quicStreamWrapper struct {
+	Stream *quic.Stream
+}
+
+func (q *quicStreamWrapper) Read(b []byte) (int, error) {
+	return q.Stream.Read(b)
+}
+
+func (q *quicStreamWrapper) Write(b []byte) (int, error) {
+	return q.Stream.Write(b)
+}
+
+func (q *quicStreamWrapper) Close() error {
+	return q.Stream.Close()
+}
+
+func (q *quicStreamWrapper) LocalAddr() net.Addr {
+	// QUIC streams don't have direct addresses, return nil
+	return nil
+}
+
+func (q *quicStreamWrapper) RemoteAddr() net.Addr {
+	// QUIC streams don't have direct addresses, return nil
+	return nil
+}
+
+func (q *quicStreamWrapper) SetDeadline(t time.Time) error {
+	return q.Stream.SetDeadline(t)
+}
+
+func (q *quicStreamWrapper) SetReadDeadline(t time.Time) error {
+	return q.Stream.SetReadDeadline(t)
+}
+
+func (q *quicStreamWrapper) SetWriteDeadline(t time.Time) error {
+	return q.Stream.SetWriteDeadline(t)
+}
+
+// quicStreamConn wraps a QUIC stream to implement net.Conn for client
+type quicStreamConn struct {
+	stream *quic.Stream
+	conn   *quic.Conn
+}
+
+func (qc *quicStreamConn) Read(b []byte) (int, error) {
+	return qc.stream.Read(b)
+}
+
+func (qc *quicStreamConn) Write(b []byte) (int, error) {
+	return qc.stream.Write(b)
+}
+
+func (qc *quicStreamConn) LocalAddr() net.Addr {
+	return qc.conn.LocalAddr()
+}
+
+func (qc *quicStreamConn) RemoteAddr() net.Addr {
+	return qc.conn.RemoteAddr()
+}
+
+func (qc *quicStreamConn) Close() error {
+	// Close the stream
+	return qc.stream.Close()
+}
+
+func (qc *quicStreamConn) SetDeadline(t time.Time) error {
+	return qc.stream.SetDeadline(t)
+}
+
+func (qc *quicStreamConn) SetReadDeadline(t time.Time) error {
+	return qc.stream.SetReadDeadline(t)
+}
+
+func (qc *quicStreamConn) SetWriteDeadline(t time.Time) error {
+	return qc.stream.SetWriteDeadline(t)
 }

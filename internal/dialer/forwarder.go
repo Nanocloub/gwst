@@ -14,47 +14,28 @@ import (
 
 	"github.com/panjf2000/ants/v2"
 	"github.com/zijiren233/gencontainer/rwmap"
+
+	"github.com/zijiren233/gwst/internal/utils"
 )
 
 const (
-	DefaultUDPPoolSize        = 512
-	DefaultBufferSize         = 16 * 1024
-	DefaultWriteTimeout       = 15 * time.Second
-	DefaultUDPCleanupInterval = 15 * time.Second
-	DefaultUDPIdleTimeout     = time.Minute
+	DefaultUDPPoolSize            = 512
+	DefaultUDPCleanupInterval     = 15 * time.Second
+	DefaultUDPIdleTimeout         = time.Minute
 	DefaultUDPEarlyDataHeaderName = "Sec-WebSocket-Protocol"
 	DefaultUDPMaxEarlyDataSize    = 4 * 1024
 )
 
-type Logger interface {
-	Infof(string, ...interface{})
-	Errorf(string, ...interface{})
-	Warnf(string, ...interface{})
-	Error(...interface{})
-}
-
-type CryptoManager interface {
-	Encrypt(plaintext []byte) ([]byte, error)
-	Decrypt(ciphertext []byte) ([]byte, error)
-}
+// 导出接口别名
+type Logger = utils.Logger
+type CryptoManager = utils.CryptoManager
+type deadlineWriter = utils.DeadlineWriter
 
 // WebSocketDialer is an interface for dialing WebSocket connections
 type WebSocketDialer interface {
 	DialTCP() (io.ReadWriteCloser, error)
 	DialUDP() (io.ReadWriteCloser, error)
 	DialUDPWithHeaders(headers http.Header) (io.ReadWriteCloser, error)
-}
-
-type deadlineWriter interface {
-	Write([]byte) (int, error)
-	SetWriteDeadline(time.Time) error
-}
-
-var sharedBufferPool = sync.Pool{
-	New: func() any {
-		buffer := make([]byte, DefaultBufferSize)
-		return &buffer
-	},
 }
 
 var sharedUDPConnInfoPool = sync.Pool{
@@ -73,28 +54,15 @@ func putUDPConnInfo(u *udpConnInfo) {
 	sharedUDPConnInfoPool.Put(u)
 }
 
-func newBufferPool(size int) *sync.Pool {
-	if size == DefaultBufferSize || size <= 0 {
-		return &sharedBufferPool
-	}
-
-	return &sync.Pool{
-		New: func() any {
-			buffer := make([]byte, size)
-			return &buffer
-		},
-	}
-}
-
 type udpConnInfo struct {
 	net.Conn
 	dialErr       error
-	remoteAddr    net.Addr              // Store remote address instead of dialer
+	remoteAddr    net.Addr // Store remote address instead of dialer
 	setUpDone     chan struct{}
 	lastActive    atomic.Int64
 	setUpDoneOnce sync.Once
 	dialLock      sync.Mutex
-	closed        atomic.Bool           // Use atomic for thread-safe access
+	closed        atomic.Bool // Use atomic for thread-safe access
 	forwarder     *Forwarder
 }
 
@@ -195,20 +163,16 @@ func (u *udpConnInfo) SetupWithEarlyData(
 
 func (u *udpConnInfo) Read(b []byte) (int, error) {
 	<-u.setUpDone
-	u.dialLock.Lock()
 
 	if u.closed.Load() {
-		u.dialLock.Unlock()
 		return 0, net.ErrClosed
 	}
 
 	if u.dialErr != nil {
-		u.dialLock.Unlock()
 		return 0, u.dialErr
 	}
 
 	conn := u.Conn
-	u.dialLock.Unlock()
 	u.SetLastActive(time.Now())
 
 	n, err := conn.Read(b)
@@ -220,23 +184,19 @@ func (u *udpConnInfo) Read(b []byte) (int, error) {
 
 func (u *udpConnInfo) Write(b []byte) (int, error) {
 	<-u.setUpDone
-	u.dialLock.Lock()
 
 	if u.closed.Load() {
-		u.dialLock.Unlock()
 		return 0, net.ErrClosed
 	}
 
 	if u.dialErr != nil {
-		u.dialLock.Unlock()
 		return 0, u.dialErr
 	}
 
 	conn := u.Conn
-	u.dialLock.Unlock()
 	u.SetLastActive(time.Now())
 
-	err := conn.SetWriteDeadline(time.Now().Add(DefaultWriteTimeout))
+	err := conn.SetWriteDeadline(time.Now().Add(utils.DefaultWriteTimeout))
 	if err != nil {
 		return 0, err
 	}
@@ -361,20 +321,6 @@ func WithMaxEarlyDataSize(size int) ForwarderOption {
 	}
 }
 
-func newSafeLogger(logger Logger) Logger {
-	if logger != nil {
-		return logger
-	}
-	return &nullLogger{}
-}
-
-type nullLogger struct{}
-
-func (n *nullLogger) Infof(string, ...interface{})  {}
-func (n *nullLogger) Errorf(string, ...interface{}) {}
-func (n *nullLogger) Warnf(string, ...interface{})  {}
-func (n *nullLogger) Error(...interface{})          {}
-
 func NewForwarder(listenAddr string, wsDialer WebSocketDialer, opts ...ForwarderOption) *Forwarder {
 	wf := &Forwarder{
 		listenAddr: listenAddr,
@@ -403,27 +349,14 @@ func NewForwarder(listenAddr string, wsDialer WebSocketDialer, opts ...Forwarder
 	}
 
 	if wf.bufferSize == 0 {
-		wf.bufferSize = DefaultBufferSize
+		wf.bufferSize = utils.DefaultBufferSize
 	}
 
-	wf.bufferPool = newBufferPool(wf.bufferSize)
+	wf.bufferPool = utils.NewBufferPool(wf.bufferSize)
 
-	wf.log = newSafeLogger(wf.log)
+	wf.log = utils.NewSafeLoggerOrNull(wf.log)
 
 	return wf
-}
-
-func (wf *Forwarder) getBuffer() *[]byte {
-	buffer := wf.bufferPool.Get().(*[]byte)
-	*buffer = (*buffer)[:cap(*buffer)]
-	return buffer
-}
-
-func (wf *Forwarder) putBuffer(buffer *[]byte) {
-	if buffer != nil {
-		*buffer = (*buffer)[:cap(*buffer)]
-		wf.bufferPool.Put(buffer)
-	}
 }
 
 func (wf *Forwarder) cleanupUDPIdleConnections() {
@@ -673,9 +606,14 @@ func (wf *Forwarder) handleTCP(conn net.Conn) {
 		wf.log.Warnf("WebSocket connection doesn't support deadlines, proceeding without them")
 	}
 
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
-		buffer := wf.getBuffer()
-		defer wf.putBuffer(buffer)
+		defer wg.Done()
+		buffer := utils.GetBuffer(wf.bufferPool)
+		defer utils.PutBuffer(wf.bufferPool, buffer)
+		defer conn.Close()
+		defer wsConn.Close()
 
 		if wsConnWithDeadline != nil {
 			_, err := wf.copyWithEncryption(wsConnWithDeadline, conn, *buffer)
@@ -691,8 +629,8 @@ func (wf *Forwarder) handleTCP(conn net.Conn) {
 		}
 	}()
 
-	buffer := wf.getBuffer()
-	defer wf.putBuffer(buffer)
+	buffer := utils.GetBuffer(wf.bufferPool)
+	defer utils.PutBuffer(wf.bufferPool, buffer)
 
 	if wsConnWithDeadline != nil {
 		_, err = wf.copyWithDecryption(conn, wsConn, *buffer)
@@ -706,23 +644,26 @@ func (wf *Forwarder) handleTCP(conn net.Conn) {
 			wf.log.Warnf("Failed to copy data to Target: %v", err)
 		}
 	}
+
+	// Wait for the copy goroutine to finish
+	wg.Wait()
 }
 
 func (wf *Forwarder) processUDP() error {
-	buffer := wf.getBuffer()
+	buffer := utils.GetBuffer(wf.bufferPool)
 
 	n, remoteAddr, err := wf.udpConn.ReadFromUDP(*buffer)
 	if err != nil {
-		wf.putBuffer(buffer)
+		utils.PutBuffer(wf.bufferPool, buffer)
 		return fmt.Errorf("failed to read from UDP: %w", err)
 	}
 
 	err = wf.udpPool.Submit(func() {
-		defer wf.putBuffer(buffer)
+		defer utils.PutBuffer(wf.bufferPool, buffer)
 
 		key := remoteAddr.String()
 		connInfo := getUDPConnInfo()
-	connInfo.forwarder = wf
+		connInfo.forwarder = wf
 
 		value, loaded := wf.udpConns.LoadOrStore(key, connInfo)
 		if !loaded {
@@ -765,7 +706,7 @@ func (wf *Forwarder) processUDP() error {
 		}
 	})
 	if err != nil {
-		wf.putBuffer(buffer)
+		utils.PutBuffer(wf.bufferPool, buffer)
 
 		if errors.Is(err, ants.ErrPoolOverload) {
 			wf.log.Errorf("UDP pool is overloaded, dropping packet: %v", remoteAddr.String())
@@ -779,116 +720,18 @@ func (wf *Forwarder) processUDP() error {
 
 // copyWithEncryption copies data from src to dst, encrypting if crypto manager is available
 func (wf *Forwarder) copyWithEncryption(dst deadlineWriter, src io.Reader, buf []byte) (written int64, err error) {
-	if wf.cryptoManager == nil {
-		return copyBufferWithWriteTimeout(dst, src, buf, DefaultWriteTimeout)
-	}
-
-	for {
-		nr, er := src.Read(buf)
-		if nr > 0 {
-			// Encrypt the data
-			encrypted, encErr := wf.cryptoManager.Encrypt(buf[:nr])
-			if encErr != nil {
-				err = encErr
-				break
-			}
-
-			err = dst.SetWriteDeadline(time.Now().Add(DefaultWriteTimeout))
-			if err != nil {
-				break
-			}
-
-			nw, ew := dst.Write(encrypted)
-			if nw < 0 || len(encrypted) < nw {
-				nw = 0
-
-				if ew == nil {
-					ew = errors.New("invalid write result")
-				}
-			}
-
-			written += int64(nr)
-
-			if ew != nil {
-				err = ew
-				break
-			}
-
-			if len(encrypted) != nw {
-				err = io.ErrShortWrite
-				break
-			}
-		}
-
-		if er != nil {
-			if er != io.EOF {
-				err = er
-			}
-			break
-		}
-	}
-
-	return written, err
+	return utils.CopyWithEncryption(dst, src, buf, wf.cryptoManager, utils.DefaultWriteTimeout)
 }
 
 // copyWithDecryption copies data from src to dst, decrypting if crypto manager is available
 func (wf *Forwarder) copyWithDecryption(dst deadlineWriter, src io.Reader, buf []byte) (written int64, err error) {
-	if wf.cryptoManager == nil {
-		return copyBufferWithWriteTimeout(dst, src, buf, DefaultWriteTimeout)
-	}
-
-	for {
-		nr, er := src.Read(buf)
-		if nr > 0 {
-			// Decrypt the data
-			decrypted, decErr := wf.cryptoManager.Decrypt(buf[:nr])
-			if decErr != nil {
-				err = decErr
-				break
-			}
-
-			err = dst.SetWriteDeadline(time.Now().Add(DefaultWriteTimeout))
-			if err != nil {
-				break
-			}
-
-			nw, ew := dst.Write(decrypted)
-			if nw < 0 || len(decrypted) < nw {
-				nw = 0
-
-				if ew == nil {
-					ew = errors.New("invalid write result")
-				}
-			}
-
-			written += int64(nw)
-
-			if ew != nil {
-				err = ew
-				break
-			}
-
-			if len(decrypted) != nw {
-				err = io.ErrShortWrite
-				break
-			}
-		}
-
-		if er != nil {
-			if er != io.EOF {
-				err = er
-			}
-			break
-		}
-	}
-
-	return written, err
+	return utils.CopyWithDecryption(dst, src, buf, wf.cryptoManager, utils.DefaultWriteTimeout)
 }
 
 func (wf *Forwarder) handleUDPResponse(value *udpConnInfo, remoteAddr *net.UDPAddr) {
-	bufferP := wf.getBuffer()
+	bufferP := utils.GetBuffer(wf.bufferPool)
 	defer func() {
-		wf.putBuffer(bufferP)
+		utils.PutBuffer(wf.bufferPool, bufferP)
 
 		if wf.udpConns.CompareAndDelete(remoteAddr.String(), value) {
 			value.Close()
@@ -911,7 +754,7 @@ func (wf *Forwarder) handleUDPResponse(value *udpConnInfo, remoteAddr *net.UDPAd
 			return
 		}
 
-		err = wf.udpConn.SetWriteDeadline(time.Now().Add(DefaultWriteTimeout))
+		err = wf.udpConn.SetWriteDeadline(time.Now().Add(utils.DefaultWriteTimeout))
 		if err != nil {
 			wf.log.Errorf("Failed to set write deadline: %v", err)
 			return
@@ -929,52 +772,3 @@ func (wf *Forwarder) handleUDPResponse(value *udpConnInfo, remoteAddr *net.UDPAd
 		}
 	}
 }
-
-func copyBufferWithWriteTimeout(
-	dst deadlineWriter,
-	src io.Reader,
-	buf []byte,
-	timeout time.Duration,
-) (written int64, err error) {
-	for {
-		nr, er := src.Read(buf)
-		if nr > 0 {
-			err = dst.SetWriteDeadline(time.Now().Add(timeout))
-			if err != nil {
-				break
-			}
-
-			nw, ew := dst.Write(buf[0:nr])
-			if nw < 0 || nr < nw {
-				nw = 0
-
-				if ew == nil {
-					ew = errors.New("invalid write result")
-				}
-			}
-
-			written += int64(nw)
-
-			if ew != nil {
-				err = ew
-				break
-			}
-
-			if nr != nw {
-				err = io.ErrShortWrite
-				break
-			}
-		}
-
-		if er != nil {
-			if er != io.EOF {
-				err = er
-			}
-			break
-		}
-	}
-
-	return written, err
-}
-
-

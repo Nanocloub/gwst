@@ -286,7 +286,7 @@ func connectConcurrent(
 		wg.Wait()
 		close(results)
 	}()
-	
+
 	// Cleanup goroutine to close unused connections after context cancellation
 	go func() {
 		<-ctx.Done()

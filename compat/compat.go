@@ -44,21 +44,21 @@ var (
 	WithHandlerKey                    = tunnel.WithHandlerKey
 	WithHandlerCryptoManager          = tunnel.WithHandlerCryptoManager
 	BalanceTargets                    = tunnel.BalanceTargets
-	
+
 	// Dialer package exports
-	NewForwarder              = dialer.NewForwarder
-	WithLogger                = dialer.WithLogger
-	WithDisableTCP            = dialer.WithDisableTCP
-	WithDisableUDP            = dialer.WithDisableUDP
-	WithUDPPool               = dialer.WithUDPPool
-	WithUDPPoolSize           = dialer.WithUDPPoolSize
-	WithUDPPoolPreAlloc       = dialer.WithUDPPoolPreAlloc
-	WithBufferSize            = dialer.WithBufferSize
-	WithUDPCleanupInterval    = dialer.WithUDPCleanupInterval
-	WithUDPIdleTimeout        = dialer.WithUDPIdleTimeout
-	WithDisableUDPEarlyData   = dialer.WithDisableUDPEarlyData
+	NewForwarder               = dialer.NewForwarder
+	WithLogger                 = dialer.WithLogger
+	WithDisableTCP             = dialer.WithDisableTCP
+	WithDisableUDP             = dialer.WithDisableUDP
+	WithUDPPool                = dialer.WithUDPPool
+	WithUDPPoolSize            = dialer.WithUDPPoolSize
+	WithUDPPoolPreAlloc        = dialer.WithUDPPoolPreAlloc
+	WithBufferSize             = dialer.WithBufferSize
+	WithUDPCleanupInterval     = dialer.WithUDPCleanupInterval
+	WithUDPIdleTimeout         = dialer.WithUDPIdleTimeout
+	WithDisableUDPEarlyData    = dialer.WithDisableUDPEarlyData
 	WithUDPEarlyDataHeaderName = dialer.WithUDPEarlyDataHeaderName
-	WithMaxEarlyDataSize      = dialer.WithMaxEarlyDataSize
+	WithMaxEarlyDataSize       = dialer.WithMaxEarlyDataSize
 )
 
 // balanceTargets is an alias for backward compatibility

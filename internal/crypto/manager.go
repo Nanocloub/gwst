@@ -77,7 +77,7 @@ func (m *Manager) Decrypt(ciphertext []byte) ([]byte, error) {
 
 	// Extract nonce from the beginning
 	nonce := ciphertext[:NonceSize]
-	
+
 	// Decrypt and verify
 	plaintext, err := m.aead.Open(nil, nonce, ciphertext[NonceSize:], nil)
 	if err != nil {

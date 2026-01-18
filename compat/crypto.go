@@ -20,7 +20,7 @@ const (
 )
 
 var (
-	ErrInvalidKeySize   = errors.New("invalid key size for AEGIS-128L")
+	ErrInvalidKeySize    = errors.New("invalid key size for AEGIS-128L")
 	ErrInvalidCiphertext = errors.New("invalid ciphertext")
 	ErrDecryptionFailed  = errors.New("decryption failed")
 )
@@ -81,7 +81,7 @@ func (cm *CryptoManager) Decrypt(ciphertext []byte) ([]byte, error) {
 
 	// Extract nonce from the beginning
 	nonce := ciphertext[:AegisNonceSize]
-	
+
 	// Decrypt and verify
 	plaintext, err := cm.aead.Open(nil, nonce, ciphertext[AegisNonceSize:], nil)
 	if err != nil {

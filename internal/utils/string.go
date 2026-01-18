@@ -1,4 +1,4 @@
-package stringutil
+package utils
 
 import "unsafe"
 

@@ -36,7 +36,6 @@ jobs:
         env:
           MICRO_ARM64_DISABLED: true
         with:
-          package: ./cmd/gwst
           targets: ${{ matrix.targets }}
           enable-micro: true
           result-dir: ./dist

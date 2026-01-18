@@ -34,7 +34,7 @@ func NewTCPServerTransport(cfg TransportServerConfig) (*TCPServerTransport, erro
 	}
 
 	if cfg.Logger == nil {
-		cfg.Logger = newSafeLogger(nil)
+		cfg.Logger = NewSafeLoggerOrNull(nil)
 	}
 
 	return &TCPServerTransport{
@@ -180,7 +180,7 @@ func NewTCPClientTransport(cfg TransportClientConfig) (*TCPClientTransport, erro
 	}
 
 	if cfg.Logger == nil {
-		cfg.Logger = newSafeLogger(nil)
+		cfg.Logger = NewSafeLoggerOrNull(nil)
 	}
 
 	if cfg.Context == nil {
