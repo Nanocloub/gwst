@@ -173,6 +173,10 @@ func (u *udpConnInfo) Read(b []byte) (int, error) {
 	}
 
 	conn := u.Conn
+	if conn == nil {
+		return 0, errors.New("connection not initialized")
+	}
+
 	u.SetLastActive(time.Now())
 
 	n, err := conn.Read(b)
@@ -194,6 +198,10 @@ func (u *udpConnInfo) Write(b []byte) (int, error) {
 	}
 
 	conn := u.Conn
+	if conn == nil {
+		return 0, errors.New("connection not initialized")
+	}
+
 	u.SetLastActive(time.Now())
 
 	err := conn.SetWriteDeadline(time.Now().Add(utils.DefaultWriteTimeout))
