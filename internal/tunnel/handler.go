@@ -329,9 +329,30 @@ var pingCodec = websocket.Codec{
 	},
 }
 
+type lockedWriter struct {
+	w  deadlineWriter
+	mu *sync.Mutex
+}
+
+func (w *lockedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	n, err := w.w.Write(p)
+	w.mu.Unlock()
+	return n, err
+}
+
+func (w *lockedWriter) SetWriteDeadline(t time.Time) error {
+	w.mu.Lock()
+	err := w.w.SetWriteDeadline(t)
+	w.mu.Unlock()
+	return err
+}
+
 func (h *Handler) handle(ws *websocket.Conn, network, addr string, fallbackAddrs []string) {
 	exit := make(chan struct{})
 	defer close(exit)
+
+	var writeMu sync.Mutex
 
 	// Set keep-alive timeouts to ensure the connection doesn't hang
 	ws.SetReadDeadline(time.Now().Add(90 * time.Second))
@@ -344,12 +365,19 @@ func (h *Handler) handle(ws *websocket.Conn, network, addr string, fallbackAddrs
 		for {
 			select {
 			case <-ticker.C:
+				writeMu.Lock()
+				// Set write deadline to prevent hanging on slow/blocked connections
+				ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
 				err := pingCodec.Send(ws, nil)
 				if err == nil {
 					// Update read deadline after successful send
 					ws.SetReadDeadline(time.Now().Add(90 * time.Second))
+					// Clear write deadline
+					ws.SetWriteDeadline(time.Time{})
+					writeMu.Unlock()
 					continue
 				}
+				writeMu.Unlock()
 
 				h.log.Errorf("Failed to send ping: %v", err)
 				_ = ws.Close()
@@ -365,14 +393,14 @@ func (h *Handler) handle(ws *websocket.Conn, network, addr string, fallbackAddrs
 	}()
 
 	if network == "udp" {
-		h.handleUDP(ws, addr, fallbackAddrs)
+		h.handleUDP(ws, addr, fallbackAddrs, &writeMu)
 		return
 	}
 
-	h.handleNetwork(ws, network, addr, fallbackAddrs)
+	h.handleNetwork(ws, network, addr, fallbackAddrs, &writeMu)
 }
 
-func (h *Handler) handleUDP(ws *websocket.Conn, addr string, fallbackAddrs []string) {
+func (h *Handler) handleUDP(ws *websocket.Conn, addr string, fallbackAddrs []string, writeMu *sync.Mutex) {
 	buffer := utils.GetBuffer(h.bufferPool)
 	defer utils.PutBuffer(h.bufferPool, buffer)
 
@@ -425,18 +453,20 @@ func (h *Handler) handleUDP(ws *websocket.Conn, addr string, fallbackAddrs []str
 	}
 	defer conn.Close()
 
+	writeMu.Lock()
 	if _, err = ws.Write((*readBuffer)[:rn]); err != nil {
+		writeMu.Unlock()
 		utils.PutBuffer(h.bufferPool, readBuffer)
 		h.log.Errorf("Failed to write to WebSocket: %v", err)
 		return
 	}
+	writeMu.Unlock()
 
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		defer conn.Close()
-		defer ws.Close()
 		defer utils.PutBuffer(h.bufferPool, readBuffer)
 
 		if _, err := utils.CopyBufferWithWriteTimeout(conn, ws, *readBuffer, utils.DefaultWriteTimeout); err != nil &&
@@ -445,7 +475,8 @@ func (h *Handler) handleUDP(ws *websocket.Conn, addr string, fallbackAddrs []str
 		}
 	}()
 
-	if _, err := utils.CopyBufferWithWriteTimeout(ws, conn, *buffer, utils.DefaultWriteTimeout); err != nil &&
+	lockedWs := &lockedWriter{w: ws, mu: writeMu}
+	if _, err := utils.CopyBufferWithWriteTimeout(lockedWs, conn, *buffer, utils.DefaultWriteTimeout); err != nil &&
 		!errors.Is(err, net.ErrClosed) {
 		h.log.Infof("Failed to copy data to WebSocket: %v", err)
 	}
@@ -454,7 +485,7 @@ func (h *Handler) handleUDP(ws *websocket.Conn, addr string, fallbackAddrs []str
 	wg.Wait()
 }
 
-func (h *Handler) handleNetwork(ws *websocket.Conn, network, addr string, fallbackAddrs []string) {
+func (h *Handler) handleNetwork(ws *websocket.Conn, network, addr string, fallbackAddrs []string, writeMu *sync.Mutex) {
 	conn, err := dial(ws.Request().Context(), network, addr, fallbackAddrs)
 	if err != nil {
 		h.log.Errorf("Failed to connect to target: %v", err)
@@ -467,7 +498,6 @@ func (h *Handler) handleNetwork(ws *websocket.Conn, network, addr string, fallba
 	go func() {
 		defer wg.Done()
 		defer conn.Close()
-		defer ws.Close()
 		buffer := utils.GetBuffer(h.bufferPool)
 		defer utils.PutBuffer(h.bufferPool, buffer)
 
@@ -480,7 +510,8 @@ func (h *Handler) handleNetwork(ws *websocket.Conn, network, addr string, fallba
 	buffer := utils.GetBuffer(h.bufferPool)
 	defer utils.PutBuffer(h.bufferPool, buffer)
 
-	if _, err := h.copyWithDecryption(ws, conn, *buffer); err != nil &&
+	lockedWs := &lockedWriter{w: ws, mu: writeMu}
+	if _, err := h.copyWithDecryption(lockedWs, conn, *buffer); err != nil &&
 		!errors.Is(err, net.ErrClosed) {
 		h.log.Infof("Failed to copy data to WebSocket: %v", err)
 	}
