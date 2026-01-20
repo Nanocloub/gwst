@@ -126,8 +126,7 @@ func (u *udpConnInfo) SetupWithEarlyData(
 ) (net.Conn, error) {
 	u.dialLock.Lock()
 	defer u.dialLock.Unlock()
-
-	u.setUpDoneOnce.Do(func() {
+	defer u.setUpDoneOnce.Do(func() {
 		close(u.setUpDone)
 	})
 
@@ -684,6 +683,7 @@ func (wf *Forwarder) processUDP() error {
 
 				go wf.handleUDPResponse(value, remoteAddr)
 
+				// Early data already sent, no need to write again
 				return
 			}
 
@@ -697,6 +697,14 @@ func (wf *Forwarder) processUDP() error {
 		} else {
 			connInfo.forwarder = nil
 			putUDPConnInfo(connInfo)
+
+			// Wait for setup to complete and check for errors
+			<-value.setUpDone
+			if value.dialErr != nil {
+				wf.log.Errorf("UDP connection has setup error: %v", value.dialErr)
+				wf.udpConns.CompareAndDelete(key, value)
+				return
+			}
 		}
 
 		_, err := value.Write((*buffer)[:n])
