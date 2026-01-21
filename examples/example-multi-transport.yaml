@@ -1,0 +1,83 @@
+# 多传输层配置示例
+# 支持: websocket, tcp, quic
+
+# WebSocket 服务端（默认）
+- is_client: false
+  listen_addr: ":8000"
+  target_addr: "localhost:80"
+  path: "/ws"
+  transport: "websocket"  # 可省略，默认为 websocket
+  key: "1234567890123456"
+  tls: true
+  cert_file: ""
+  key_file: ""
+  server_name: "example.com"
+
+# WebSocket 客户端
+- is_client: true
+  listen_addr: ":9000"
+  target_addr: "127.0.0.1:8000"
+  host: "example.com"
+  path: "/ws"
+  transport: "websocket"
+  key: "1234567890123456"
+  tls: true
+  server_name: "example.com"
+  insecure: true
+
+# TCP 服务端
+- is_client: false
+  listen_addr: ":8001"
+  target_addr: "localhost:80"
+  transport: "tcp"
+  key: "1234567890123456"
+  tls: false
+
+# TCP 客户端
+- is_client: true
+  listen_addr: ":9001"
+  target_addr: "127.0.0.1:8001"
+  transport: "tcp"
+  key: "1234567890123456"
+  tls: false
+
+# TCP+TLS 服务端
+- is_client: false
+  listen_addr: ":8002"
+  target_addr: "localhost:80"
+  transport: "tcp"
+  key: "1234567890123456"
+  tls: true
+  cert_file: "cert.pem"
+  key_file: "key.pem"
+  server_name: "example.com"
+
+# TCP+TLS 客户端
+- is_client: true
+  listen_addr: ":9002"
+  target_addr: "127.0.0.1:8002"
+  transport: "tcp"
+  key: "1234567890123456"
+  tls: true
+  server_name: "example.com"
+  insecure: true
+
+# QUIC 服务端（需要集成 quic-go）
+- is_client: false
+  listen_addr: ":8003"
+  target_addr: "localhost:80"
+  transport: "quic"
+  key: "1234567890123456"
+  tls: true
+  cert_file: "cert.pem"
+  key_file: "key.pem"
+  server_name: "example.com"
+
+# QUIC 客户端（需要集成 quic-go）
+- is_client: true
+  listen_addr: ":9003"
+  target_addr: "127.0.0.1:8003"
+  transport: "quic"
+  key: "1234567890123456"
+  server_name: "example.com"
+  insecure: true

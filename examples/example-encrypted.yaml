@@ -1,0 +1,45 @@
+# 带 AEGIS-128L 加密的配置示例
+# 注意：key 参数需要至少 16 字节才能启用加密
+
+# 服务端配置（使用加密）
+- is_client: false
+  listen_addr: ":8000"
+  target_addr: "localhost:80"
+  path: "/ws"
+  key: "1234567890123456"  # 16字节密钥，启用 AEGIS-128L 加密
+  tls: true
+  cert_file: ""
+  key_file: ""
+  server_name: "example.com"
+
+# 客户端配置（使用加密）
+- is_client: true
+  listen_addr: ":9090"
+  target_addr: "127.0.0.1:8000"
+  host: "example.com"
+  path: "/ws"
+  key: "1234567890123456"  # 必须与服务端使用相同的 16字节密钥
+  tls: true
+  server_name: "example.com"
+  insecure: true
+
+# 服务端配置（不使用加密）
+- is_client: false
+  listen_addr: ":8001"
+  target_addr: "localhost:8080"
+  path: "/ws"
+  key: "short"  # 密钥少于 16 字节，不启用加密
+
+# 客户端配置（不使用加密）
+- is_client: true
+  listen_addr: ":9091"
+  target_addr: "localhost:8001"
+  host: "localhost"
+  path: "/ws"
+  key: "short"
+
+# 配置说明：
+# 1. key 参数必须至少 16 字节才能启用 AEGIS-128L 加密
+# 2. 客户端和服务端必须使用完全相同的密钥（前16字节）
+# 3. 加密会自动应用于所有 WebSocket 数据传输
+# 4. 支持 TCP 和 UDP 协议的加密传输
