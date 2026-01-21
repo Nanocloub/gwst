@@ -645,3 +645,71 @@ func (h *Handler) Close() {
 func (h *Handler) Wait() {
 	h.connectionsWg.Wait()
 }
+
+// GetDefaultTarget 返回默认目标地址
+func (h *Handler) GetDefaultTarget() string {
+	return h.defaultTargetAddr
+}
+
+// GetFallbackAddrs 返回回退地址列表
+func (h *Handler) GetFallbackAddrs() []string {
+	return h.fallbackAddrs
+}
+
+// HandleRawConnection 处理原始连接（用于 TCP/QUIC 传输）
+func (h *Handler) HandleRawConnection(conn net.Conn, protocol, target string, fallbackAddrs []string) error {
+	h.connectionsWg.Add(1)
+	defer h.connectionsWg.Done()
+
+	h.log.Infof(
+		"Received %s connection:\n\tAddr: %v\n\tTarget: %s\n\tFallback: %v\n\tProtocol: %s",
+		protocol,
+		conn.RemoteAddr(),
+		target,
+		fallbackAddrs,
+		protocol,
+	)
+
+	if h.loadBalance {
+		target, fallbackAddrs = BalanceTargets(target, fallbackAddrs)
+	}
+
+	// 使用 handleNetwork 方法处理连接
+	if protocol == "udp" {
+		// UDP 不适用于原始 TCP/QUIC 连接
+		return fmt.Errorf("UDP protocol not supported for raw connections")
+	}
+
+	// 直接复制数据
+	targetConn, err := dial(context.Background(), protocol, target, fallbackAddrs)
+	if err != nil {
+		h.log.Errorf("Failed to connect to target: %v", err)
+		return err
+	}
+	defer targetConn.Close()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer targetConn.Close()
+		buffer := utils.GetBuffer(h.bufferPool)
+		defer utils.PutBuffer(h.bufferPool, buffer)
+
+		if _, err := h.copyWithEncryption(targetConn, conn, *buffer); err != nil &&
+			!errors.Is(err, net.ErrClosed) {
+			h.log.Infof("Failed to copy data to Target: %v", err)
+		}
+	}()
+
+	buffer := utils.GetBuffer(h.bufferPool)
+	defer utils.PutBuffer(h.bufferPool, buffer)
+
+	if _, err := h.copyWithDecryption(conn, targetConn, *buffer); err != nil &&
+		!errors.Is(err, net.ErrClosed) {
+		h.log.Infof("Failed to copy data to connection: %v", err)
+	}
+
+	wg.Wait()
+	return nil
+}

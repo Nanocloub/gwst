@@ -1,5 +1,3 @@
 gwst
 gwst.exe
-*.yaml
-!example.yaml
 **/*.local

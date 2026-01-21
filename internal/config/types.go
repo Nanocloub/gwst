@@ -135,6 +135,12 @@ func (e *Endpoint) Validate() error {
 		return fmt.Errorf("invalid transport type: %s", e.Transport)
 	}
 
+	// 验证 QUIC 传输必须启用 TLS
+	transportType := e.GetTransportType()
+	if transportType == string(TransportQUIC) && !e.TLS {
+		return fmt.Errorf("QUIC transport requires TLS to be enabled (set tls: true)")
+	}
+
 	// 验证 TLS 配置
 	if e.TLS {
 		if !e.IsClient && (e.CertFile == "" || e.KeyFile == "") {

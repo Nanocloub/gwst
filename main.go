@@ -175,6 +175,7 @@ func newServer(endpoint config.Endpoint) *compat.Server {
 
 	opts := []compat.ServerOption{
 		compat.WithListenAddr(endpoint.ListenAddr),
+		compat.WithTransport(endpoint.GetTransportType()),
 	}
 	if endpoint.TLS {
 		opts = append(opts,
@@ -199,6 +200,7 @@ func newClient(endpoint config.Endpoint) *compat.Forwarder {
 		compat.WithDialServerName(endpoint.ServerName),
 		compat.WithInsecure(endpoint.Insecure),
 		compat.WithKey(endpoint.Key),
+		compat.WithTransportType(endpoint.GetTransportType()),
 	}
 
 	forwarderOpts := []compat.ForwarderOption{

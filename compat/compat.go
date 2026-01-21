@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/zijiren233/gwst/internal/dialer"
+	"github.com/zijiren233/gwst/internal/transport"
 	"github.com/zijiren233/gwst/internal/tunnel"
 )
 
@@ -69,7 +70,8 @@ type Server struct {
 	listenErr             error
 	shutdowned            chan struct{}
 	onListened            chan struct{}
-	server                *http.Server
+	server                *http.Server              // for WebSocket
+	serverTransport       transport.ServerTransport // for TCP/QUIC
 	wsHandler             *Handler
 	tlsConfig             *tls.Config
 	path                  string
@@ -80,6 +82,7 @@ type Server struct {
 	selfSignedCertOptions []SelfSignedCertOption
 	waitListenCloseOnce   sync.Once
 	tls                   bool
+	transport             string // "websocket", "tcp", or "quic"
 }
 
 type ServerOption func(*Server)
@@ -125,12 +128,19 @@ func WithSelfSignedCert(opts ...SelfSignedCertOption) ServerOption {
 	}
 }
 
+func WithTransport(transport string) ServerOption {
+	return func(ps *Server) {
+		ps.transport = transport
+	}
+}
+
 func NewServer(path string, wsHandler *Handler, opts ...ServerOption) *Server {
 	ps := &Server{
 		wsHandler:  wsHandler,
 		path:       path,
 		onListened: make(chan struct{}),
 		shutdowned: make(chan struct{}),
+		transport:  "websocket", // 默认使用 websocket
 	}
 
 	for _, opt := range opts {
@@ -156,6 +166,12 @@ func (ps *Server) WaitShutdown() {
 }
 
 func (ps *Server) Serve() error {
+	// 对于 TCP 和 QUIC 传输，使用 transport 包
+	if ps.transport == "tcp" || ps.transport == "quic" {
+		return ps.serveWithTransport()
+	}
+
+	// 对于 WebSocket，使用原来的实现
 	server := ps.Server()
 
 	defer ps.closeWaitListen()
@@ -249,11 +265,113 @@ func (ps *Server) Server() *http.Server {
 
 func (ps *Server) Close() error {
 	defer ps.closeWaitListen()
-	return ps.server.Close()
+
+	// 根据传输类型关闭相应的服务器
+	if ps.serverTransport != nil {
+		return ps.serverTransport.Close()
+	}
+
+	if ps.server != nil {
+		return ps.server.Close()
+	}
+
+	return nil
 }
 
 func (ps *Server) Shutdown(ctx context.Context) error {
 	defer ps.closeWaitListen()
 	defer ps.wsHandler.Wait()
-	return ps.server.Shutdown(ctx)
+
+	// TCP/QUIC 没有优雅关闭，直接 Close
+	if ps.serverTransport != nil {
+		return ps.serverTransport.Close()
+	}
+
+	// WebSocket 支持优雅关闭
+	if ps.server != nil {
+		return ps.server.Shutdown(ctx)
+	}
+
+	return nil
+}
+
+// serveWithTransport 使用 transport 包处理 TCP 和 QUIC 传输
+func (ps *Server) serveWithTransport() error {
+	defer ps.closeWaitListen()
+	defer close(ps.shutdowned)
+
+	// 将 transport 字符串转换为 TransportType
+	var transportType transport.TransportType
+	switch ps.transport {
+	case "tcp":
+		transportType = transport.TransportTCP
+	case "quic":
+		transportType = transport.TransportQUIC
+	default:
+		ps.listenErr = fmt.Errorf("unsupported transport type: %s", ps.transport)
+		return ps.listenErr
+	}
+
+	// 创建传输配置
+	cfg := transport.TransportServerConfig{
+		Type:       transportType,
+		ListenAddr: ps.listenAddr,
+		Handler:    ps.createTransportHandler(),
+		TLS:        ps.tls,
+		CertFile:   ps.certFile,
+		KeyFile:    ps.keyFile,
+		Logger:     transport.NewSafeLoggerOrNull(nil),
+	}
+
+	// 创建传输管理器
+	tm := transport.NewTransportManager()
+
+	// 创建服务端传输
+	serverTransport, err := tm.CreateServerTransport(cfg)
+	if err != nil {
+		ps.listenErr = err
+		return err
+	}
+
+	// 保存引用以便 Close() 时使用
+	ps.serverTransport = serverTransport
+
+	// 等待监听完成
+	go func() {
+		if err := serverTransport.WaitListen(); err != nil {
+			ps.listenErr = err
+		}
+		ps.closeWaitListen()
+	}()
+
+	// 启动服务
+	return serverTransport.Serve()
+}
+
+// createTransportHandler 创建一个适配器函数，将 Handler 适配到 transport.Handler 接口
+func (ps *Server) createTransportHandler() func(net.Conn) error {
+	return func(conn net.Conn) error {
+		defer conn.Close()
+
+		// 创建一个简单的 HTTP 请求对象用于处理
+		// 对于 TCP/QUIC 传输，我们需要从连接中读取协议信息
+		// 这里我们使用默认的 TCP 协议
+		protocol := "tcp"
+
+		// 获取目标地址
+		target := ps.wsHandler.GetDefaultTarget()
+		fallbackAddrs := ps.wsHandler.GetFallbackAddrs()
+
+		if target == "" && len(fallbackAddrs) == 0 {
+			return fmt.Errorf("no target configured")
+		}
+
+		if target == "" && len(fallbackAddrs) > 0 {
+			target = fallbackAddrs[0]
+			fallbackAddrs = fallbackAddrs[1:]
+		}
+
+		// 调用 Handler 的内部处理逻辑
+		return ps.wsHandler.HandleRawConnection(conn, protocol, target, fallbackAddrs)
+	}
 }

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	tls "github.com/refraction-networking/utls"
+	"github.com/zijiren233/gwst/internal/transport"
 	"golang.org/x/net/websocket"
 )
 
@@ -48,18 +49,19 @@ func (c *ConnectAddrConfig) Clone() *ConnectAddrConfig {
 }
 
 type ConnectDialConfig struct {
-	Dialer      *net.Dialer
-	Headers     http.Header
-	Host        string
-	Path        string
-	Target      string
-	NamedTarget string
-	ServerName  string
-	Key         string
-	TLS         bool
-	Insecure    bool
-	UDP         bool
-	LoadBalance bool
+	Dialer        *net.Dialer
+	Headers       http.Header
+	Host          string
+	Path          string
+	Target        string
+	NamedTarget   string
+	ServerName    string
+	Key           string
+	TLS           bool
+	Insecure      bool
+	UDP           bool
+	LoadBalance   bool
+	TransportType string // \"websocket\", \"tcp\", or \"quic\"
 }
 
 type splitedConnectDialConfig struct {
@@ -196,6 +198,12 @@ func WithKey(key string) ConnectOption {
 	}
 }
 
+func WithTransportType(transportType string) ConnectOption {
+	return func(c *ConnectConfig) {
+		c.TransportType = transportType
+	}
+}
+
 func Connect(ctx context.Context, opts ...ConnectOption) (net.Conn, error) {
 	cfg := ConnectConfig{}
 	for _, opt := range opts {
@@ -206,6 +214,17 @@ func Connect(ctx context.Context, opts ...ConnectOption) (net.Conn, error) {
 }
 
 func ConnectWithConfig(ctx context.Context, cfg ConnectConfig) (net.Conn, error) {
+	// 如果未指定 transport，默认使用 websocket
+	if cfg.TransportType == "" {
+		cfg.TransportType = "websocket"
+	}
+
+	// 对于 TCP 和 QUIC 传输，使用 transport 包
+	if cfg.TransportType == "tcp" || cfg.TransportType == "quic" {
+		return connectWithTransport(ctx, cfg)
+	}
+
+	// 对于 WebSocket，使用原来的实现
 	if cfg.Addr == "" && len(cfg.FallbackAddrs) > 0 {
 		cfg.Addr = cfg.FallbackAddrs[0]
 		cfg.FallbackAddrs = cfg.FallbackAddrs[1:]
@@ -540,4 +559,41 @@ func (wc *Dialer) DialTCP(options ...ConnectOption) (net.Conn, error) {
 
 func (wc *Dialer) DialContextTCP(ctx context.Context, options ...ConnectOption) (net.Conn, error) {
 	return wc.DialContext(ctx, "tcp", options...)
+}
+
+// connectWithTransport 使用 transport 包进行连接（TCP 或 QUIC）
+func connectWithTransport(ctx context.Context, cfg ConnectConfig) (net.Conn, error) {
+	// 将 transport 字符串转换为 TransportType
+	var transportType transport.TransportType
+	switch cfg.TransportType {
+	case "tcp":
+		transportType = transport.TransportTCP
+	case "quic":
+		transportType = transport.TransportQUIC
+	default:
+		return nil, fmt.Errorf("unsupported transport type: %s", cfg.TransportType)
+	}
+
+	// 创建传输配置
+	transportCfg := transport.TransportClientConfig{
+		Type:       transportType,
+		RemoteAddr: cfg.Addr,
+		ServerName: cfg.ServerName,
+		Insecure:   cfg.Insecure,
+		TLS:        cfg.TLS,
+		Context:    ctx,
+		Logger:     transport.NewSafeLoggerOrNull(nil),
+	}
+
+	// 创建传输管理器
+	tm := transport.NewTransportManager()
+
+	// 创建客户端传输
+	clientTransport, err := tm.CreateClientTransport(transportCfg)
+	if err != nil {
+		return nil, err
+	}
+
+	// 拨号连接
+	return clientTransport.Dial(ctx)
 }
