@@ -79,5 +79,6 @@
   target_addr: "127.0.0.1:8003"
   transport: "quic"
   key: "1234567890123456"
+  tls: true
   server_name: "example.com"
   insecure: true
