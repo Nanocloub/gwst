@@ -109,7 +109,7 @@ func (qst *QUICServerTransport) Serve() error {
 }
 
 // handleConnection 处理单个 QUIC 连接
-func (qst *QUICServerTransport) handleConnection(conn *quic.Conn) {
+func (qst *QUICServerTransport) handleConnection(conn quic.Connection) {
 	defer qst.connectionWg.Done()
 	defer conn.CloseWithError(0, "connection closed")
 
@@ -121,7 +121,7 @@ func (qst *QUICServerTransport) handleConnection(conn *quic.Conn) {
 		}
 
 		// Handle each stream as a separate connection
-		go func(s *quic.Stream) {
+		go func(s quic.Stream) {
 			defer s.Close()
 			if err := qst.config.Handler(&quicStreamWrapper{Stream: s}); err != nil {
 				qst.config.Logger.Infof("Stream handler error: %v", err)
@@ -245,7 +245,7 @@ func (qct *QUICClientTransport) Close() error {
 
 // quicStreamWrapper wraps a QUIC stream to implement net.Conn
 type quicStreamWrapper struct {
-	Stream *quic.Stream
+	Stream quic.Stream
 }
 
 func (q *quicStreamWrapper) Read(b []byte) (int, error) {
@@ -284,8 +284,8 @@ func (q *quicStreamWrapper) SetWriteDeadline(t time.Time) error {
 
 // quicStreamConn wraps a QUIC stream to implement net.Conn for client
 type quicStreamConn struct {
-	stream *quic.Stream
-	conn   *quic.Conn
+	stream quic.Stream
+	conn   quic.Connection
 }
 
 func (qc *quicStreamConn) Read(b []byte) (int, error) {
