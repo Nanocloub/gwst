@@ -75,8 +75,9 @@ type Endpoint struct {
 	Host      string `yaml:"host"`
 	Transport string `yaml:"transport"`
 
-	// 加密
-	Key string `yaml:"key"`
+	// 认证和加密
+	Key           string `yaml:"key"`            // 认证密钥(X-Key)，如果encryption_key未设置也用于加密
+	EncryptionKey string `yaml:"encryption_key"` // 独立的加密密钥(推荐)，优先级高于key
 
 	// TLS 配置
 	TLS        bool   `yaml:"tls"`

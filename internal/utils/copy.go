@@ -23,9 +23,30 @@ type DeadlineWriter interface {
 type CryptoManager interface {
 	Encrypt(plaintext []byte) ([]byte, error)
 	Decrypt(ciphertext []byte) ([]byte, error)
+	EncryptTo(dst, plaintext []byte) ([]byte, error)
+	DecryptTo(dst, ciphertext []byte) ([]byte, error)
 }
 
 var sharedBufferPool = sync.Pool{
+	New: func() any {
+		buffer := make([]byte, DefaultBufferSize)
+		return &buffer
+	},
+}
+
+// cryptoOverhead AEGIS-128L 加密开销 (nonce + tag)
+const cryptoOverhead = 32
+
+// encryptBufferPool 用于加密缓冲区复用（16KB + 32字节开销）
+var encryptBufferPool = sync.Pool{
+	New: func() any {
+		buffer := make([]byte, DefaultBufferSize+cryptoOverhead)
+		return &buffer
+	},
+}
+
+// decryptBufferPool 用于解密缓冲区复用（16KB）
+var decryptBufferPool = sync.Pool{
 	New: func() any {
 		buffer := make([]byte, DefaultBufferSize)
 		return &buffer
@@ -133,11 +154,24 @@ func CopyWithEncryption(
 		timeout = DefaultWriteTimeout
 	}
 
+	// 从池中获取加密缓冲区
+	encryptBufPtr := encryptBufferPool.Get().(*[]byte)
+	encryptBuf := *encryptBufPtr
+	defer encryptBufferPool.Put(encryptBufPtr)
+
+	// 确保缓冲区足够大
+	requiredSize := len(buf) + cryptoOverhead
+	if len(encryptBuf) < requiredSize {
+		// 如果池中的缓冲区太小，重新分配
+		encryptBuf = make([]byte, requiredSize)
+		*encryptBufPtr = encryptBuf
+	}
+
 	for {
 		nr, er := src.Read(buf)
 		if nr > 0 {
-			// Encrypt the data
-			encrypted, encErr := cm.Encrypt(buf[:nr])
+			// 使用零分配 API 加密数据
+			encrypted, encErr := cm.EncryptTo(encryptBuf, buf[:nr])
 			if encErr != nil {
 				err = encErr
 				break
@@ -197,11 +231,23 @@ func CopyWithDecryption(
 		timeout = DefaultWriteTimeout
 	}
 
+	// 从池中获取解密缓冲区
+	decryptBufPtr := decryptBufferPool.Get().(*[]byte)
+	decryptBuf := *decryptBufPtr
+	defer decryptBufferPool.Put(decryptBufPtr)
+
+	// 确保缓冲区足够大
+	if len(decryptBuf) < len(buf) {
+		// 如果池中的缓冲区太小，重新分配
+		decryptBuf = make([]byte, len(buf))
+		*decryptBufPtr = decryptBuf
+	}
+
 	for {
 		nr, er := src.Read(buf)
 		if nr > 0 {
-			// Decrypt the data
-			decrypted, decErr := cm.Decrypt(buf[:nr])
+			// 使用零分配 API 解密数据
+			decrypted, decErr := cm.DecryptTo(decryptBuf, buf[:nr])
 			if decErr != nil {
 				err = decErr
 				break

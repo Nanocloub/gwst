@@ -60,6 +60,7 @@ var (
 	WithDisableUDPEarlyData    = dialer.WithDisableUDPEarlyData
 	WithUDPEarlyDataHeaderName = dialer.WithUDPEarlyDataHeaderName
 	WithMaxEarlyDataSize       = dialer.WithMaxEarlyDataSize
+	WithCryptoManager          = dialer.WithCryptoManager
 )
 
 // balanceTargets is an alias for backward compatibility

@@ -154,9 +154,13 @@ func (tst *TCPServerTransport) Close() error {
 			close(done)
 		}()
 
+		// 使用 Timer 而不是 time.After，避免泄漏
+		timer := time.NewTimer(5 * time.Second)
+		defer timer.Stop()
+
 		select {
 		case <-done:
-		case <-time.After(time.Second * 5):
+		case <-timer.C:
 		}
 
 		close(tst.shutdowned)

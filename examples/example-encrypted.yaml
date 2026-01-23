@@ -1,45 +1,72 @@
-# 带 AEGIS-128L 加密的配置示例
-# 注意：key 参数需要至少 16 字节才能启用加密
+# 安全的加密配置示例
+# 使用独立的 encryption_key 字段分离认证和加密
 
-# 服务端配置（使用加密）
+# 推荐配置：使用独立的 encryption_key
 - is_client: false
   listen_addr: ":8000"
   target_addr: "localhost:80"
   path: "/ws"
-  key: "1234567890123456"  # 16字节密钥，启用 AEGIS-128L 加密
+  key: "my-auth-secret"           # 仅用于 X-Key 认证
+  encryption_key: "1234567890123456"  # 仅用于数据加密（16字节）
   tls: true
-  cert_file: ""
-  key_file: ""
-  server_name: "example.com"
+  cert_file: "cert.pem"
+  key_file: "key.pem"
 
-# 客户端配置（使用加密）
 - is_client: true
-  listen_addr: ":9090"
+  listen_addr: ":9000"
   target_addr: "127.0.0.1:8000"
-  host: "example.com"
-  path: "/ws"
-  key: "1234567890123456"  # 必须与服务端使用相同的 16字节密钥
-  tls: true
-  server_name: "example.com"
-  insecure: true
-
-# 服务端配置（不使用加密）
-- is_client: false
-  listen_addr: ":8001"
-  target_addr: "localhost:8080"
-  path: "/ws"
-  key: "short"  # 密钥少于 16 字节，不启用加密
-
-# 客户端配置（不使用加密）
-- is_client: true
-  listen_addr: ":9091"
-  target_addr: "localhost:8001"
   host: "localhost"
   path: "/ws"
-  key: "short"
+  key: "my-auth-secret"           # 必须与服务端相同
+  encryption_key: "1234567890123456"  # 必须与服务端相同
+  tls: true
+  insecure: false
+
+# 向后兼容：仅使用 key（不推荐）
+- is_client: false
+  listen_addr: ":8001"
+  target_addr: "localhost:80"
+  path: "/ws"
+  key: "1234567890123456"  # 同时用于认证和加密
+  tls: true  # 必须启用 TLS！
+  cert_file: "cert.pem"
+  key_file: "key.pem"
+
+- is_client: true
+  listen_addr: ":9001"
+  target_addr: "127.0.0.1:8001"
+  host: "localhost"
+  path: "/ws"
+  key: "1234567890123456"
+  tls: true
+
+# TCP 传输的加密配置
+- is_client: false
+  listen_addr: ":8002"
+  target_addr: "localhost:80"
+  transport: "tcp"
+  key: "auth-key"
+  encryption_key: "encryption-key-16b"
+  tls: true
+  cert_file: "cert.pem"
+  key_file: "key.pem"
+
+- is_client: true
+  listen_addr: ":9002"
+  target_addr: "127.0.0.1:8002"
+  transport: "tcp"
+  key: "auth-key"
+  encryption_key: "encryption-key-16b"
+  tls: true
 
 # 配置说明：
-# 1. key 参数必须至少 16 字节才能启用 AEGIS-128L 加密
-# 2. 客户端和服务端必须使用完全相同的密钥（前16字节）
-# 3. 加密会自动应用于所有 WebSocket 数据传输
-# 4. 支持 TCP 和 UDP 协议的加密传输
+# 1. encryption_key（推荐）：
+#    - 独立的加密密钥，不通过 HTTP 头传输
+#    - 必须至少 16 字节
+#    - 客户端和服务端必须完全相同
+#
+# 2. key（认证）：
+#    - 通过 X-Key HTTP 头传输，用于访问控制
+#    - 任意长度
+#    - 如果未设置 encryption_key 且 key >= 16 字节，会用 key 的前 16 字节加密
+

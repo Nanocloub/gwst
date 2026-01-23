@@ -73,7 +73,7 @@ type udpConnInfo struct {
 	dialLock      sync.Mutex
 	closed        atomic.Bool // Use atomic for thread-safe access
 	forwarder     *Forwarder
-	needsFraming  bool // 缓存是否需要帧封装的判断结果
+	needsFraming  bool        // 缓存是否需要帧封装的判断结果
 	framingCached atomic.Bool // 标记是否已缓存
 }
 
@@ -366,6 +366,12 @@ func WithUDPEarlyDataHeaderName(name string) ForwarderOption {
 func WithMaxEarlyDataSize(size int) ForwarderOption {
 	return func(f *Forwarder) {
 		f.udpMaxEarlyDataSize = size
+	}
+}
+
+func WithCryptoManager(cm CryptoManager) ForwarderOption {
+	return func(f *Forwarder) {
+		f.cryptoManager = cm
 	}
 }
 

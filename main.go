@@ -12,6 +12,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/zijiren233/gwst/compat"
 	"github.com/zijiren233/gwst/internal/config"
+	"github.com/zijiren233/gwst/internal/crypto"
 )
 
 func init() {
@@ -110,7 +111,7 @@ func printEndpointInfo(ep config.Endpoint) {
 
 func printClientEndpointInfo(ep config.Endpoint) {
 	transportInfo := fmt.Sprintf("Transport: %s", ep.GetTransportType())
-	
+
 	if ep.Target == "" && ep.NamedTarget == "" {
 		log.Infof("Starting client on %s -> %s (%s)", ep.ListenAddr, ep.TargetAddr, transportInfo)
 	} else if ep.NamedTarget != "" {
@@ -122,7 +123,7 @@ func printClientEndpointInfo(ep config.Endpoint) {
 
 func printServerEndpointInfo(ep config.Endpoint) {
 	transportInfo := fmt.Sprintf("Transport: %s", ep.GetTransportType())
-	
+
 	if len(ep.AllowedTargets) != 0 || len(ep.NamedTargets) != 0 {
 		if ep.TargetAddr == "" {
 			log.Infof("Starting server on %s (%s)", ep.ListenAddr, transportInfo)
@@ -168,7 +169,8 @@ func newServer(endpoint config.Endpoint) *compat.Server {
 		}
 	}
 
-	handler := compat.NewHandler(
+	// 如果 key 长度 >= 16 字节，创建 CryptoManager 启用加密
+	handlerOpts := []compat.HandlerOption{
 		compat.WithHandlerLogger(log.StandardLogger()),
 		compat.WithHandlerDefaultTargetAddr(endpoint.TargetAddr),
 		compat.WithHandlerAllowedTargets(endpoint.AllowedTargets),
@@ -176,7 +178,49 @@ func newServer(endpoint config.Endpoint) *compat.Server {
 		compat.WithHandlerFallbackAddrs(endpoint.FallbackAddrs),
 		compat.WithHandlerLoadBalance(endpoint.LoadBalance),
 		compat.WithHandlerKey(endpoint.Key),
-	)
+	}
+
+	// 优先使用 encryption_key，其次使用 key
+	var encryptionKey string
+	var keySource string // 用于日志
+
+	if endpoint.EncryptionKey != "" {
+		encryptionKey = endpoint.EncryptionKey
+		keySource = "encryption_key"
+
+		// 验证 encryption_key 的有效性
+		if len(encryptionKey) < crypto.KeySize {
+			log.Errorf("❌ encryption_key length (%d) < 16 bytes, encryption disabled", len(encryptionKey))
+			encryptionKey = "" // 清除，不尝试使用 key
+		}
+	} else if endpoint.Key != "" {
+		encryptionKey = endpoint.Key
+		keySource = "key"
+
+		if len(encryptionKey) < crypto.KeySize {
+			log.Warnf("⚠️  'key' length (%d) < 16 bytes, encryption disabled", len(encryptionKey))
+			encryptionKey = "" // 清除
+		} else {
+			// key >= 16 字节，会用于加密
+			log.Warnf("⚠️  Security Warning: Using 'key' for both authentication and encryption. Recommend using separate 'encryption_key' field.")
+			if !endpoint.TLS {
+				log.Errorf("🚨 CRITICAL: 'key' sent in X-Key header without TLS! Encryption key is exposed. Enable TLS or use 'encryption_key'.")
+			}
+		}
+	}
+
+	// 统一的加密启用逻辑
+	if encryptionKey != "" {
+		cryptoManager, err := crypto.NewManager([]byte(encryptionKey[:crypto.KeySize]))
+		if err != nil {
+			log.Warnf("Failed to create crypto manager: %v, encryption disabled", err)
+		} else {
+			handlerOpts = append(handlerOpts, compat.WithHandlerCryptoManager(cryptoManager))
+			log.Infof("✅ AEGIS-128L encryption enabled for server on %s (using %s)", endpoint.ListenAddr, keySource)
+		}
+	}
+
+	handler := compat.NewHandler(handlerOpts...)
 
 	opts := []compat.ServerOption{
 		compat.WithListenAddr(endpoint.ListenAddr),
@@ -211,6 +255,47 @@ func newClient(endpoint config.Endpoint) *compat.Forwarder {
 	forwarderOpts := []compat.ForwarderOption{
 		compat.WithLogger(log.StandardLogger()),
 	}
+
+	// 优先使用 encryption_key，其次使用 key
+	var encryptionKey string
+	var keySource string // 用于日志
+
+	if endpoint.EncryptionKey != "" {
+		encryptionKey = endpoint.EncryptionKey
+		keySource = "encryption_key"
+
+		// 验证 encryption_key 的有效性
+		if len(encryptionKey) < crypto.KeySize {
+			log.Errorf("❌ encryption_key length (%d) < 16 bytes, encryption disabled", len(encryptionKey))
+			encryptionKey = "" // 清除，不尝试使用 key
+		}
+	} else if endpoint.Key != "" {
+		encryptionKey = endpoint.Key
+		keySource = "key"
+
+		if len(encryptionKey) < crypto.KeySize {
+			log.Warnf("⚠️  'key' length (%d) < 16 bytes, encryption disabled", len(encryptionKey))
+			encryptionKey = "" // 清除
+		} else {
+			// key >= 16 字节，会用于加密
+			log.Warnf("⚠️  Security Warning: Using 'key' for both authentication and encryption. Recommend using separate 'encryption_key' field.")
+			if !endpoint.TLS {
+				log.Errorf("🚨 CRITICAL: 'key' sent in X-Key header without TLS! Encryption key is exposed. Enable TLS or use 'encryption_key'.")
+			}
+		}
+	}
+
+	// 统一的加密启用逻辑
+	if encryptionKey != "" {
+		cryptoManager, err := crypto.NewManager([]byte(encryptionKey[:crypto.KeySize]))
+		if err != nil {
+			log.Warnf("Failed to create crypto manager: %v, encryption disabled", err)
+		} else {
+			forwarderOpts = append(forwarderOpts, compat.WithCryptoManager(cryptoManager))
+			log.Infof("✅ AEGIS-128L encryption enabled for client on %s (using %s)", endpoint.ListenAddr, keySource)
+		}
+	}
+
 	if endpoint.DisableTCP {
 		forwarderOpts = append(forwarderOpts, compat.WithDisableTCP())
 	}
