@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	stdlog "log"
 	"net/http"
@@ -108,19 +109,23 @@ func printEndpointInfo(ep config.Endpoint) {
 }
 
 func printClientEndpointInfo(ep config.Endpoint) {
+	transportInfo := fmt.Sprintf("Transport: %s", ep.GetTransportType())
+	
 	if ep.Target == "" && ep.NamedTarget == "" {
-		log.Infof("Starting client on %s -> %s", ep.ListenAddr, ep.TargetAddr)
+		log.Infof("Starting client on %s -> %s (%s)", ep.ListenAddr, ep.TargetAddr, transportInfo)
 	} else if ep.NamedTarget != "" {
-		log.Infof("Starting client on %s -> %s (Named: %s)", ep.ListenAddr, ep.TargetAddr, ep.NamedTarget)
+		log.Infof("Starting client on %s -> %s (Named: %s, %s)", ep.ListenAddr, ep.TargetAddr, ep.NamedTarget, transportInfo)
 	} else {
-		log.Infof("Starting client on %s -> %s (Target: %s)", ep.ListenAddr, ep.TargetAddr, ep.Target)
+		log.Infof("Starting client on %s -> %s (Target: %s, %s)", ep.ListenAddr, ep.TargetAddr, ep.Target, transportInfo)
 	}
 }
 
 func printServerEndpointInfo(ep config.Endpoint) {
+	transportInfo := fmt.Sprintf("Transport: %s", ep.GetTransportType())
+	
 	if len(ep.AllowedTargets) != 0 || len(ep.NamedTargets) != 0 {
 		if ep.TargetAddr == "" {
-			log.Infof("Starting server on %s", ep.ListenAddr)
+			log.Infof("Starting server on %s (%s)", ep.ListenAddr, transportInfo)
 
 			if len(ep.AllowedTargets) != 0 {
 				log.Warnf("\tAllowed targets: %v", ep.AllowedTargets)
@@ -134,7 +139,7 @@ func printServerEndpointInfo(ep config.Endpoint) {
 				}
 			}
 		} else {
-			log.Infof("Starting server on %s -> %s", ep.ListenAddr, ep.TargetAddr)
+			log.Infof("Starting server on %s -> %s (%s)", ep.ListenAddr, ep.TargetAddr, transportInfo)
 
 			if len(ep.AllowedTargets) != 0 {
 				log.Warnf("\tAdditional allowed targets: %v", ep.AllowedTargets)
@@ -149,7 +154,7 @@ func printServerEndpointInfo(ep config.Endpoint) {
 			}
 		}
 	} else {
-		log.Infof("Starting server on %s -> %s", ep.ListenAddr, ep.TargetAddr)
+		log.Infof("Starting server on %s -> %s (%s)", ep.ListenAddr, ep.TargetAddr, transportInfo)
 	}
 }
 

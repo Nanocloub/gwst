@@ -429,7 +429,7 @@ func (h *Handler) handleUDP(ws *websocket.Conn, addr string, fallbackAddrs []str
 
 		n, err = ws.Read(*buffer)
 		if err != nil {
-			h.log.Errorf("Failed to read from WebSocket: %v", err)
+			h.log.Errorf("Failed to read from tunnel connection: %v", err)
 			return
 		}
 
@@ -674,10 +674,9 @@ func (h *Handler) HandleRawConnection(conn net.Conn, protocol, target string, fa
 		target, fallbackAddrs = BalanceTargets(target, fallbackAddrs)
 	}
 
-	// 使用 handleNetwork 方法处理连接
+	// 对于 UDP 协议，使用特殊处理
 	if protocol == "udp" {
-		// UDP 不适用于原始 TCP/QUIC 连接
-		return fmt.Errorf("UDP protocol not supported for raw connections")
+		return h.handleRawUDP(conn, target, fallbackAddrs)
 	}
 
 	// 直接复制数据
@@ -709,6 +708,129 @@ func (h *Handler) HandleRawConnection(conn net.Conn, protocol, target string, fa
 		!errors.Is(err, net.ErrClosed) {
 		h.log.Infof("Failed to copy data to connection: %v", err)
 	}
+
+	wg.Wait()
+	return nil
+}
+
+// handleRawUDP 处理原始连接上的 UDP 流量（用于 TCP/QUIC 传输）
+// UDP over stream: 使用简单的长度前缀帧格式
+func (h *Handler) handleRawUDP(conn net.Conn, addr string, fallbackAddrs []string) error {
+	// 连接到 UDP 目标
+	targetConn, err := net.Dial("udp", addr)
+	if err != nil {
+		if len(fallbackAddrs) == 0 {
+			h.log.Errorf("Failed to connect to UDP target: %v", err)
+			return err
+		}
+
+		// 尝试回退地址
+		var errs []error
+		errs = append(errs, err)
+		for _, fallbackAddr := range fallbackAddrs {
+			targetConn, err = net.Dial("udp", fallbackAddr)
+			if err == nil {
+				h.log.Infof("Connected to fallback UDP target: %s", fallbackAddr)
+				break
+			}
+			errs = append(errs, err)
+		}
+
+		if targetConn == nil {
+			h.log.Errorf("Failed to connect to UDP target: %v", errors.Join(errs...))
+			return errors.Join(errs...)
+		}
+	}
+	defer targetConn.Close()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// 从客户端读取，写入目标（客户端 -> 服务端 -> 目标）
+	go func() {
+		defer wg.Done()
+		defer targetConn.Close()
+		
+		buffer := utils.GetBuffer(h.bufferPool)
+		defer utils.PutBuffer(h.bufferPool, buffer)
+
+		// 预分配 lenBuf，避免在循环中重复分配
+		var lenBuf [2]byte
+
+		for {
+			// 读取帧长度（2字节）
+			if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
+				if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+					h.log.Infof("Failed to read UDP frame length from client: %v", err)
+				}
+				return
+			}
+
+			frameLen := int(lenBuf[0])<<8 | int(lenBuf[1])
+			if frameLen == 0 {
+				h.log.Warnf("Received zero-length UDP frame from client, ignoring")
+				continue
+			}
+			if frameLen > len(*buffer) {
+				h.log.Errorf("UDP frame too large: %d bytes (buffer: %d)", frameLen, len(*buffer))
+				return
+			}
+
+			// 读取帧数据
+			if _, err := io.ReadFull(conn, (*buffer)[:frameLen]); err != nil {
+				if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+					h.log.Infof("Failed to read UDP frame data from client: %v", err)
+				}
+				return
+			}
+
+			// 写入目标
+			if _, err := targetConn.Write((*buffer)[:frameLen]); err != nil {
+				if !errors.Is(err, net.ErrClosed) {
+					h.log.Infof("Failed to write to UDP target: %v", err)
+				}
+				return
+			}
+		}
+	}()
+
+	// 从目标读取，写入客户端（目标 -> 服务端 -> 客户端）
+	go func() {
+		defer wg.Done()
+		defer conn.Close()
+		buffer := utils.GetBuffer(h.bufferPool)
+		defer utils.PutBuffer(h.bufferPool, buffer)
+
+		// 预分配帧缓冲区，最大 65535 + 2 字节
+		frameBuffer := make([]byte, 2+len(*buffer))
+
+		for {
+			// 读取 UDP 数据包
+			n, err := targetConn.Read(*buffer)
+			if err != nil {
+				if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+					h.log.Infof("Failed to read from UDP target: %v", err)
+				}
+				return
+			}
+
+			if n == 0 {
+				continue
+			}
+
+			// 封装成帧：长度 + 数据，使用单次 Write 减少系统调用
+			frameBuffer[0] = byte(n >> 8)
+			frameBuffer[1] = byte(n & 0xff)
+			copy(frameBuffer[2:], (*buffer)[:n])
+
+			if _, err := conn.Write(frameBuffer[:2+n]); err != nil {
+				if !errors.Is(err, net.ErrClosed) {
+					h.log.Infof("Failed to write UDP frame to client: %v", err)
+				}
+				return
+			}
+		}
+	}()
 
 	wg.Wait()
 	return nil

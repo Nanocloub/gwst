@@ -353,10 +353,17 @@ func (ps *Server) createTransportHandler() func(net.Conn) error {
 	return func(conn net.Conn) error {
 		defer conn.Close()
 
-		// 创建一个简单的 HTTP 请求对象用于处理
-		// 对于 TCP/QUIC 传输，我们需要从连接中读取协议信息
-		// 这里我们使用默认的 TCP 协议
+		// 从连接中读取协议标识字节
+		// 0x01 = TCP, 0x02 = UDP
+		protocolByte := make([]byte, 1)
+		if _, err := conn.Read(protocolByte); err != nil {
+			return fmt.Errorf("failed to read protocol byte: %w", err)
+		}
+
 		protocol := "tcp"
+		if protocolByte[0] == 0x02 {
+			protocol = "udp"
+		}
 
 		// 获取目标地址
 		target := ps.wsHandler.GetDefaultTarget()

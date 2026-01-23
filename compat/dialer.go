@@ -595,5 +595,21 @@ func connectWithTransport(ctx context.Context, cfg ConnectConfig) (net.Conn, err
 	}
 
 	// 拨号连接
-	return clientTransport.Dial(ctx)
+	conn, err := clientTransport.Dial(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// 发送协议标识字节
+	// 0x01 = TCP, 0x02 = UDP
+	protocolByte := byte(0x01)
+	if cfg.UDP {
+		protocolByte = 0x02
+	}
+	if _, err := conn.Write([]byte{protocolByte}); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to write protocol byte: %w", err)
+	}
+
+	return conn, nil
 }

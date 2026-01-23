@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -46,6 +47,14 @@ var sharedUDPConnInfoPool = sync.Pool{
 	},
 }
 
+// frameBufferPool 用于复用 UDP 帧缓冲区（最大 65537 字节：2字节长度 + 65535字节数据）
+var frameBufferPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 65537)
+		return &buf
+	},
+}
+
 func getUDPConnInfo() *udpConnInfo {
 	return sharedUDPConnInfoPool.Get().(*udpConnInfo)
 }
@@ -64,6 +73,8 @@ type udpConnInfo struct {
 	dialLock      sync.Mutex
 	closed        atomic.Bool // Use atomic for thread-safe access
 	forwarder     *Forwarder
+	needsFraming  bool // 缓存是否需要帧封装的判断结果
+	framingCached atomic.Bool // 标记是否已缓存
 }
 
 func (u *udpConnInfo) Close() error {
@@ -208,7 +219,37 @@ func (u *udpConnInfo) Write(b []byte) (int, error) {
 		return 0, err
 	}
 
-	n, err := conn.Write(b)
+	// 检查是否需要帧封装（TCP/QUIC 传输），首次判断后缓存结果
+	if !u.framingCached.Load() {
+		u.needsFraming = isStreamConn(conn)
+		u.framingCached.Store(true)
+	}
+
+	var n int
+	if u.needsFraming {
+		// 写入帧长度（2字节）+ 数据，使用单次 Write 减少系统调用
+		if len(b) > 65535 {
+			return 0, fmt.Errorf("UDP packet too large: %d bytes (max 65535)", len(b))
+		}
+		// 从池中获取帧缓冲区，避免频繁分配
+		framePtr := frameBufferPool.Get().(*[]byte)
+		frame := *framePtr
+		frame[0] = byte(len(b) >> 8)
+		frame[1] = byte(len(b) & 0xff)
+		copy(frame[2:], b)
+		n, err = conn.Write(frame[:2+len(b)])
+		// 立即归还到池中
+		frameBufferPool.Put(framePtr)
+		if err != nil {
+			return 0, err
+		}
+		// 返回实际数据长度，不包括帧头
+		n = len(b)
+	} else {
+		// WebSocket 模式：直接写入
+		n, err = conn.Write(b)
+	}
+
 	if err != nil {
 		return 0, err
 	}
@@ -601,7 +642,7 @@ func (wf *Forwarder) handleTCP(conn net.Conn) {
 
 	wsConn, err := wf.wsDialer.DialTCP()
 	if err != nil {
-		wf.log.Errorf("Failed to dial WebSocket: %v", err)
+		wf.log.Errorf("Failed to dial tunnel connection: %v", err)
 		return
 	}
 	defer wsConn.Close()
@@ -610,7 +651,7 @@ func (wf *Forwarder) handleTCP(conn net.Conn) {
 	wsConnWithDeadline, ok := wsConn.(deadlineWriter)
 	if !ok {
 		// If not, we skip deadline operations but still copy data
-		wf.log.Warnf("WebSocket connection doesn't support deadlines, proceeding without them")
+		wf.log.Warnf("Tunnel connection doesn't support deadlines, proceeding without them")
 	}
 
 	var wg sync.WaitGroup
@@ -625,13 +666,13 @@ func (wf *Forwarder) handleTCP(conn net.Conn) {
 		if wsConnWithDeadline != nil {
 			_, err := wf.copyWithEncryption(wsConnWithDeadline, conn, *buffer)
 			if err != nil && !errors.Is(err, net.ErrClosed) {
-				wf.log.Warnf("Failed to copy data to WebSocket: %v", err)
+				wf.log.Warnf("Failed to copy data to tunnel: %v", err)
 			}
 		} else {
 			// Fall back to simple copy without encryption
 			_, err := io.Copy(wsConn, conn)
 			if err != nil && !errors.Is(err, net.ErrClosed) {
-				wf.log.Warnf("Failed to copy data to WebSocket: %v", err)
+				wf.log.Warnf("Failed to copy data to tunnel: %v", err)
 			}
 		}
 	}()
@@ -756,15 +797,56 @@ func (wf *Forwarder) handleUDPResponse(value *udpConnInfo, remoteAddr *net.UDPAd
 
 	buffer := *bufferP
 
+	// 检查连接是否需要帧封装（TCP/QUIC 传输模式），使用缓存的判断结果
+	if !value.framingCached.Load() {
+		value.needsFraming = isStreamConn(value.Conn)
+		value.framingCached.Store(true)
+	}
+	needsFraming := value.needsFraming
+
+	// 预分配 lenBuf，避免在循环中重复分配
+	var lenBuf [2]byte
+
 	for {
-		n, err := value.Read(buffer)
+		var n int
+		var err error
+
+		if needsFraming {
+			// 读取帧长度（2字节）
+			if _, err := io.ReadFull(value.Conn, lenBuf[:]); err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
+				if !errors.Is(err, io.EOF) {
+					wf.log.Errorf("Failed to read UDP frame length from tunnel: %v", err)
+				}
+				return
+			}
+
+			frameLen := int(lenBuf[0])<<8 | int(lenBuf[1])
+			if frameLen == 0 {
+				wf.log.Warnf("Received zero-length UDP frame, ignoring")
+				continue
+			}
+			if frameLen > len(buffer) {
+				wf.log.Errorf("UDP frame too large: %d bytes (buffer: %d)", frameLen, len(buffer))
+				return
+			}
+
+			// 读取帧数据
+			n, err = io.ReadFull(value.Conn, buffer[:frameLen])
+		} else {
+			// WebSocket 模式：直接读取
+			n, err = value.Read(buffer)
+		}
+
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
 
 			if !errors.Is(err, io.EOF) {
-				wf.log.Errorf("Failed to read from WebSocket: %v", err)
+				wf.log.Errorf("Failed to read from tunnel connection: %v", err)
 			}
 
 			return
@@ -786,5 +868,20 @@ func (wf *Forwarder) handleUDPResponse(value *udpConnInfo, remoteAddr *net.UDPAd
 
 			return
 		}
+	}
+}
+
+// isStreamConn 检查连接是否是流式连接（TCP/QUIC），而不是 WebSocket
+func isStreamConn(conn net.Conn) bool {
+	// TCP/QUIC 连接会是 *net.TCPConn 或 *tls.Conn 包装的 TCPConn
+	// WebSocket 连接类型名包含 "websocket" 或 "Conn"（指 websocket.Conn）
+	switch conn.(type) {
+	case *net.TCPConn:
+		return true
+	default:
+		// 检查类型名，WebSocket 连接通常包含 "websocket"
+		typeName := fmt.Sprintf("%T", conn)
+		// 使用 strings.Contains 更高效
+		return !strings.Contains(strings.ToLower(typeName), "websocket")
 	}
 }
