@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/zijiren233/gwst/compat"
+	"github.com/zijiren233/gwst/internal/crypto"
 )
 
 // isClosedNetworkError checks if the error is a "use of closed network connection" error
@@ -376,9 +377,16 @@ func TestTunnelWithEncryption(t *testing.T) {
 	// 2. Start tunnel server with encryption
 	encryptionKey := "test-encryption-key-32-bytes!"
 	serverAddr := "127.0.0.1:18885"
+
+	// Create crypto manager for encryption
+	cryptoManager, err := crypto.NewManager([]byte(encryptionKey[:crypto.KeySize]))
+	if err != nil {
+		t.Fatalf("Failed to create crypto manager: %v", err)
+	}
+
 	handler := compat.NewHandler(
 		compat.WithHandlerDefaultTargetAddr(echoAddr),
-		compat.WithHandlerKey(encryptionKey),
+		compat.WithHandlerCryptoManager(cryptoManager),
 	)
 
 	server := compat.NewServer("/tunnel", handler,
@@ -400,7 +408,6 @@ func TestTunnelWithEncryption(t *testing.T) {
 	opts := []compat.ConnectOption{
 		compat.WithAddr(serverAddr),
 		compat.WithPath("/tunnel"),
-		compat.WithKey(encryptionKey),
 	}
 
 	wsDialer := compat.NewDialer(opts...)
@@ -410,6 +417,7 @@ func TestTunnelWithEncryption(t *testing.T) {
 		clientAddr,
 		dialerAdapter,
 		compat.WithDisableUDP(),
+		compat.WithCryptoManager(cryptoManager), // Use the same crypto manager
 	)
 
 	go func() {
