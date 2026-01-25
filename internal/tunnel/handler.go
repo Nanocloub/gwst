@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"sync"
@@ -433,6 +433,20 @@ func (h *Handler) handleUDP(ws *websocket.Conn, addr string, fallbackAddrs []str
 			return
 		}
 
+		if h.cryptoManager != nil {
+			// Acquire a temporary buffer for decryption to avoid allocation
+			dstBuf := utils.GetBuffer(h.bufferPool)
+			decrypted, err := h.cryptoManager.DecryptTo(*dstBuf, *buffer)
+			if err != nil {
+				utils.PutBuffer(h.bufferPool, dstBuf)
+				h.log.Errorf("Failed to decrypt X-0RTT/First packet: %v", err)
+				return
+			}
+			// Copy decrypted data back to buffer
+			n = copy(*buffer, decrypted)
+			utils.PutBuffer(h.bufferPool, dstBuf)
+		}
+
 		err = ws.SetReadDeadline(time.Time{})
 		if err != nil {
 			h.log.Errorf("Failed to set read deadline: %v", err)
@@ -454,10 +468,27 @@ func (h *Handler) handleUDP(ws *websocket.Conn, addr string, fallbackAddrs []str
 	defer conn.Close()
 
 	writeMu.Lock()
-	if _, err = ws.Write((*readBuffer)[:rn]); err != nil {
+	var writeErr error
+	if h.cryptoManager != nil {
+		dstBuf := utils.GetBuffer(h.bufferPool)
+		encrypted, err := h.cryptoManager.EncryptTo(*dstBuf, (*readBuffer)[:rn])
+		if err != nil {
+			utils.PutBuffer(h.bufferPool, dstBuf)
+			writeMu.Unlock()
+			utils.PutBuffer(h.bufferPool, readBuffer)
+			h.log.Errorf("Failed to encrypt response: %v", err)
+			return
+		}
+		_, writeErr = ws.Write(encrypted)
+		utils.PutBuffer(h.bufferPool, dstBuf)
+	} else {
+		_, writeErr = ws.Write((*readBuffer)[:rn])
+	}
+
+	if writeErr != nil {
 		writeMu.Unlock()
 		utils.PutBuffer(h.bufferPool, readBuffer)
-		h.log.Errorf("Failed to write to WebSocket: %v", err)
+		h.log.Errorf("Failed to write to WebSocket: %v", writeErr)
 		return
 	}
 	writeMu.Unlock()
@@ -469,16 +500,82 @@ func (h *Handler) handleUDP(ws *websocket.Conn, addr string, fallbackAddrs []str
 		defer conn.Close()
 		defer utils.PutBuffer(h.bufferPool, readBuffer)
 
-		if _, err := utils.CopyBufferWithWriteTimeout(conn, ws, *readBuffer, utils.DefaultWriteTimeout); err != nil &&
-			!errors.Is(err, net.ErrClosed) {
-			h.log.Infof("Failed to copy data to Target: %v", err)
+		// UDP: Read from WS(Tunnel) -> Decrypt -> Write to Target
+		// Note: copyWithDecryption expects the source to be length-prefixed stream.
+		// BUT WebSocket messages are already framed.
+		// If h.cryptoManager is used, we need packet-based decryption if it's WebSocket.
+		// Wait, copyWithDecryption is designed for Stream (TCP).
+		// For UDP over WebSocket, we just loop Read/Write packets.
+
+		if h.cryptoManager != nil {
+			// Custom loop for Encrypted Message based UDP
+			buf := *readBuffer
+			dstBuf := utils.GetBuffer(h.bufferPool)
+			defer utils.PutBuffer(h.bufferPool, dstBuf)
+
+			for {
+				n, err := ws.Read(buf)
+				if err != nil {
+					if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+						h.log.Infof("Failed to read from Tunnel: %v", err)
+					}
+					return
+				}
+
+				decrypted, err := h.cryptoManager.DecryptTo(*dstBuf, buf[:n])
+				if err != nil {
+					h.log.Warnf("Failed to decrypt UDP packet: %v", err)
+					return
+				}
+
+				if _, err := conn.Write(decrypted); err != nil {
+					h.log.Infof("Failed to write to Target: %v", err)
+					return
+				}
+			}
+		} else {
+			if _, err := utils.CopyBufferWithWriteTimeout(conn, ws, *readBuffer, utils.DefaultWriteTimeout); err != nil &&
+				!errors.Is(err, net.ErrClosed) {
+				h.log.Infof("Failed to copy data to Target: %v", err)
+			}
 		}
 	}()
 
 	lockedWs := &lockedWriter{w: ws, mu: writeMu}
-	if _, err := utils.CopyBufferWithWriteTimeout(lockedWs, conn, *buffer, utils.DefaultWriteTimeout); err != nil &&
-		!errors.Is(err, net.ErrClosed) {
-		h.log.Infof("Failed to copy data to WebSocket: %v", err)
+
+	if h.cryptoManager != nil {
+		// Custom loop for Target(UDP) -> Encrypt -> WS(Tunnel)
+		buf := *buffer
+		dstBuf := utils.GetBuffer(h.bufferPool)
+		defer utils.PutBuffer(h.bufferPool, dstBuf)
+
+		for {
+			n, err := conn.Read(buf)
+			if err != nil {
+				if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+					h.log.Infof("Failed to read from Target: %v", err)
+				}
+				return
+			}
+
+			// We must encrypt before protecting with lock?
+			// Ideally yes, but we need to write to lockedWs.
+			encrypted, err := h.cryptoManager.EncryptTo(*dstBuf, buf[:n])
+			if err != nil {
+				h.log.Warnf("Failed to encrypt UDP packet: %v", err)
+				return
+			}
+
+			if _, err := lockedWs.Write(encrypted); err != nil {
+				h.log.Infof("Failed to write to Tunnel: %v", err)
+				return
+			}
+		}
+	} else {
+		if _, err := utils.CopyBufferWithWriteTimeout(lockedWs, conn, *buffer, utils.DefaultWriteTimeout); err != nil &&
+			!errors.Is(err, net.ErrClosed) {
+			h.log.Infof("Failed to copy data to WebSocket: %v", err)
+		}
 	}
 
 	// Wait for the copy goroutine to finish
@@ -501,7 +598,9 @@ func (h *Handler) handleNetwork(ws *websocket.Conn, network, addr string, fallba
 		buffer := utils.GetBuffer(h.bufferPool)
 		defer utils.PutBuffer(h.bufferPool, buffer)
 
-		if _, err := h.copyWithEncryption(conn, ws, *buffer); err != nil &&
+		// Direction: Tunnel(ws) -> Target(conn)
+		// We read Encrypted stream from Tunnel, Decrypt, Write Plain to Target.
+		if _, err := h.copyWithDecryption(conn, ws, *buffer); err != nil &&
 			!errors.Is(err, net.ErrClosed) {
 			h.log.Infof("Failed to copy data to Target: %v", err)
 		}
@@ -511,7 +610,10 @@ func (h *Handler) handleNetwork(ws *websocket.Conn, network, addr string, fallba
 	defer utils.PutBuffer(h.bufferPool, buffer)
 
 	lockedWs := &lockedWriter{w: ws, mu: writeMu}
-	if _, err := h.copyWithDecryption(lockedWs, conn, *buffer); err != nil &&
+
+	// Direction: Target(conn) -> Tunnel(ws)
+	// We read Plain from Target, Encrypt, Write Encrypted stream to Tunnel.
+	if _, err := h.copyWithEncryption(lockedWs, conn, *buffer); err != nil &&
 		!errors.Is(err, net.ErrClosed) {
 		h.log.Infof("Failed to copy data to WebSocket: %v", err)
 	}
@@ -695,7 +797,9 @@ func (h *Handler) HandleRawConnection(conn net.Conn, protocol, target string, fa
 		buffer := utils.GetBuffer(h.bufferPool)
 		defer utils.PutBuffer(h.bufferPool, buffer)
 
-		if _, err := h.copyWithEncryption(targetConn, conn, *buffer); err != nil &&
+		// Direction: Tunnel(conn) -> Target(targetConn)
+		// Tunnel sends [Len][Encrypted]. We Read, Decrypt, Write Raw to Target.
+		if _, err := h.copyWithDecryption(targetConn, conn, *buffer); err != nil &&
 			!errors.Is(err, net.ErrClosed) {
 			h.log.Infof("Failed to copy data to Target: %v", err)
 		}
@@ -704,9 +808,11 @@ func (h *Handler) HandleRawConnection(conn net.Conn, protocol, target string, fa
 	buffer := utils.GetBuffer(h.bufferPool)
 	defer utils.PutBuffer(h.bufferPool, buffer)
 
-	if _, err := h.copyWithDecryption(conn, targetConn, *buffer); err != nil &&
+	// Direction: Target(targetConn) -> Tunnel(conn)
+	// Target sends Raw. We Read, Encrypt, Frame [Len][Encrypted], Write to Tunnel.
+	if _, err := h.copyWithEncryption(conn, targetConn, *buffer); err != nil &&
 		!errors.Is(err, net.ErrClosed) {
-		h.log.Infof("Failed to copy data to connection: %v", err)
+		h.log.Infof("Failed to copy data to Tunnel: %v", err)
 	}
 
 	wg.Wait()
@@ -750,7 +856,7 @@ func (h *Handler) handleRawUDP(conn net.Conn, addr string, fallbackAddrs []strin
 	go func() {
 		defer wg.Done()
 		defer targetConn.Close()
-		
+
 		buffer := utils.GetBuffer(h.bufferPool)
 		defer utils.PutBuffer(h.bufferPool, buffer)
 
@@ -784,12 +890,33 @@ func (h *Handler) handleRawUDP(conn net.Conn, addr string, fallbackAddrs []strin
 				return
 			}
 
-			// 写入目标
-			if _, err := targetConn.Write((*buffer)[:frameLen]); err != nil {
-				if !errors.Is(err, net.ErrClosed) {
-					h.log.Infof("Failed to write to UDP target: %v", err)
+			dataToWrite := (*buffer)[:frameLen]
+			if h.cryptoManager != nil {
+				// Use a temporary buffer for decryption
+				dstBuf := utils.GetBuffer(h.bufferPool)
+				decrypted, err := h.cryptoManager.DecryptTo(*dstBuf, dataToWrite)
+				if err != nil {
+					utils.PutBuffer(h.bufferPool, dstBuf)
+					h.log.Warnf("Failed to decrypt UDP frame: %v", err)
+					return
 				}
-				return
+				// Write decrypted data to target
+				_, err = targetConn.Write(decrypted)
+				utils.PutBuffer(h.bufferPool, dstBuf)
+				if err != nil {
+					if !errors.Is(err, net.ErrClosed) {
+						h.log.Infof("Failed to write to UDP target: %v", err)
+					}
+					return
+				}
+			} else {
+				// 写入目标
+				if _, err := targetConn.Write(dataToWrite); err != nil {
+					if !errors.Is(err, net.ErrClosed) {
+						h.log.Infof("Failed to write to UDP target: %v", err)
+					}
+					return
+				}
 			}
 		}
 	}()
@@ -818,16 +945,66 @@ func (h *Handler) handleRawUDP(conn net.Conn, addr string, fallbackAddrs []strin
 				continue
 			}
 
-			// 封装成帧：长度 + 数据，使用单次 Write 减少系统调用
-			frameBuffer[0] = byte(n >> 8)
-			frameBuffer[1] = byte(n & 0xff)
-			copy(frameBuffer[2:], (*buffer)[:n])
+			dataLen := n
+			var dataToSend []byte
 
-			if _, err := conn.Write(frameBuffer[:2+n]); err != nil {
-				if !errors.Is(err, net.ErrClosed) {
-					h.log.Infof("Failed to write UDP frame to client: %v", err)
+			if h.cryptoManager != nil {
+				// Calculate required size for encrypted data
+				// Overhead is usually fixed but let's rely on EncryptTo logic or just ensure buffer is big enough
+				// EncryptTo needs dst to be large enough.
+				// We can reuse frameBuffer for encryption destination if we are careful.
+				// frameBuffer structure: [Len(2)][EncryptedData...]
+
+				// Max overhead for AEGIS-128L is 32 bytes.
+				// We need to ensure frameBuffer is large enough.
+				maxEncLen := dataLen + 32 // 32 is cryptoOverhead constant in copy.go but not exported here. 32 is safe.
+				if len(frameBuffer) < 2+maxEncLen {
+					frameBuffer = make([]byte, 2+maxEncLen)
 				}
-				return
+
+				encrypted, err := h.cryptoManager.EncryptTo(frameBuffer[2:], (*buffer)[:n])
+				if err != nil {
+					h.log.Warnf("Failed to encrypt UDP frame: %v", err)
+					return
+				}
+				dataToSend = encrypted
+				dataLen = len(encrypted)
+
+				// fill length
+				frameBuffer[0] = byte(dataLen >> 8)
+				frameBuffer[1] = byte(dataLen & 0xff)
+
+				// write frame
+				if _, err := conn.Write(frameBuffer[:2+dataLen]); err != nil {
+					if !errors.Is(err, net.ErrClosed) {
+						h.log.Infof("Failed to write to client: %v", err)
+					}
+					return
+				}
+			} else {
+				dataToSend = (*buffer)[:n]
+
+				if dataLen > 65535 {
+					h.log.Errorf("Packet too large: %d", dataLen)
+					continue
+				}
+
+				// 封装成帧：长度 + 数据，使用单次 Write 减少系统调用
+				// Ensure frameBuffer is large enough
+				if len(frameBuffer) < 2+dataLen {
+					frameBuffer = make([]byte, 2+dataLen)
+				}
+
+				frameBuffer[0] = byte(dataLen >> 8)
+				frameBuffer[1] = byte(dataLen & 0xff)
+				copy(frameBuffer[2:], dataToSend)
+
+				if _, err := conn.Write(frameBuffer[:2+dataLen]); err != nil {
+					if !errors.Is(err, net.ErrClosed) {
+						h.log.Infof("Failed to write to client: %v", err)
+					}
+					return
+				}
 			}
 		}
 	}()

@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"encoding/binary"
 	"errors"
 	"io"
 	"sync"
@@ -34,10 +35,10 @@ var sharedBufferPool = sync.Pool{
 	},
 }
 
-// cryptoOverhead AEGIS-128L 加密开销 (nonce + tag)
-const cryptoOverhead = 32
+// cryptoOverhead AEGIS-128L 加密开销 (nonce + tag) + 2字节长度头
+const cryptoOverhead = 32 + 2
 
-// encryptBufferPool 用于加密缓冲区复用（16KB + 32字节开销）
+// encryptBufferPool 用于加密缓冲区复用（16KB + 34字节开销）
 var encryptBufferPool = sync.Pool{
 	New: func() any {
 		buffer := make([]byte, DefaultBufferSize+cryptoOverhead)
@@ -168,22 +169,38 @@ func CopyWithEncryption(
 	}
 
 	for {
-		nr, er := src.Read(buf)
+		// Limit read size to ensure the resulting encrypted packet fits within a standard buffer
+		// (assuming the receiver uses a buffer of the same size as buf)
+		readBuf := buf
+		if len(buf) > cryptoOverhead {
+			readBuf = buf[:len(buf)-cryptoOverhead]
+		}
+
+		nr, er := src.Read(readBuf)
 		if nr > 0 {
-			// 使用零分配 API 加密数据
-			encrypted, encErr := cm.EncryptTo(encryptBuf, buf[:nr])
+			// 1. 在开头预留2字节长度
+			// 2. 加密数据到 offset 2
+			payloadBuf := encryptBuf[2:]
+			encrypted, encErr := cm.EncryptTo(payloadBuf, buf[:nr])
 			if encErr != nil {
 				err = encErr
 				break
 			}
+
+			// 写入长度头
+			totalLen := len(encrypted)
+			binary.BigEndian.PutUint16(encryptBuf[:2], uint16(totalLen))
+
+			// 发送 [Len][EncryptedBody]
+			packet := encryptBuf[:2+totalLen]
 
 			err = dst.SetWriteDeadline(time.Now().Add(timeout))
 			if err != nil {
 				break
 			}
 
-			nw, ew := dst.Write(encrypted)
-			if nw < 0 || len(encrypted) < nw {
+			nw, ew := dst.Write(packet)
+			if nw < 0 || len(packet) < nw {
 				nw = 0
 
 				if ew == nil {
@@ -198,7 +215,7 @@ func CopyWithEncryption(
 				break
 			}
 
-			if len(encrypted) != nw {
+			if len(packet) != nw {
 				err = io.ErrShortWrite
 				break
 			}
@@ -219,7 +236,7 @@ func CopyWithEncryption(
 func CopyWithDecryption(
 	dst DeadlineWriter,
 	src io.Reader,
-	buf []byte,
+	buf []byte, // reusable buffer for reading ciphertext
 	cm CryptoManager,
 	timeout time.Duration,
 ) (written int64, err error) {
@@ -231,59 +248,80 @@ func CopyWithDecryption(
 		timeout = DefaultWriteTimeout
 	}
 
-	// 从池中获取解密缓冲区
-	decryptBufPtr := decryptBufferPool.Get().(*[]byte)
-	decryptBuf := *decryptBufPtr
-	defer decryptBufferPool.Put(decryptBufPtr)
+	// 从池中获取解密缓冲区 (用于存放解密后的 plaintext)
+	plaintextBufPtr := decryptBufferPool.Get().(*[]byte)
+	plaintextBuf := *plaintextBufPtr
+	defer decryptBufferPool.Put(plaintextBufPtr)
 
-	// 确保缓冲区足够大
-	if len(decryptBuf) < len(buf) {
-		// 如果池中的缓冲区太小，重新分配
-		decryptBuf = make([]byte, len(buf))
-		*decryptBufPtr = decryptBuf
-	}
+	// Length header buffer
+	var lenBuf [2]byte
 
 	for {
-		nr, er := src.Read(buf)
-		if nr > 0 {
-			// 使用零分配 API 解密数据
-			decrypted, decErr := cm.DecryptTo(decryptBuf, buf[:nr])
-			if decErr != nil {
-				err = decErr
-				break
-			}
-
-			err = dst.SetWriteDeadline(time.Now().Add(timeout))
-			if err != nil {
-				break
-			}
-
-			nw, ew := dst.Write(decrypted)
-			if nw < 0 || len(decrypted) < nw {
-				nw = 0
-
-				if ew == nil {
-					ew = errors.New("invalid write result")
-				}
-			}
-
-			written += int64(nw)
-
-			if ew != nil {
-				err = ew
-				break
-			}
-
-			if len(decrypted) != nw {
-				err = io.ErrShortWrite
-				break
-			}
-		}
-
-		if er != nil {
+		// 1. Read Length Header
+		if _, er := io.ReadFull(src, lenBuf[:]); er != nil {
 			if er != io.EOF {
 				err = er
 			}
+			break
+		}
+		length := int(binary.BigEndian.Uint16(lenBuf[:]))
+
+		// Ensure read buffer is large enough for ciphertext
+		if len(buf) < length {
+			// Grow buffer if needed (shouldn't happen often if buf is large enough)
+			// Note: buf is usually DefaultBufferSize (16KB)
+			// If a packet > 16KB comes:
+			newBuf := make([]byte, length)
+			buf = newBuf
+			// We don't update caller's pointer but we use it locally
+		}
+
+		// 2. Read Ciphertext Body
+		if _, er := io.ReadFull(src, buf[:length]); er != nil {
+			if er == io.EOF {
+				err = io.ErrUnexpectedEOF
+			} else {
+				err = er
+			}
+			break
+		}
+
+		// Ensure plaintext buffer is large enough
+		if len(plaintextBuf) < length {
+			plaintextBuf = make([]byte, length)
+			*plaintextBufPtr = plaintextBuf
+		}
+
+		// 3. Decrypt
+		decrypted, decErr := cm.DecryptTo(plaintextBuf, buf[:length])
+		if decErr != nil {
+			err = decErr
+			break
+		}
+
+		// 4. Write Plaintext
+		err = dst.SetWriteDeadline(time.Now().Add(timeout))
+		if err != nil {
+			break
+		}
+
+		nw, ew := dst.Write(decrypted)
+		if nw < 0 || len(decrypted) < nw {
+			nw = 0
+			if ew == nil {
+				ew = errors.New("invalid write result")
+			}
+		}
+
+		written += int64(nw)
+
+		if ew != nil {
+			err = ew
+			break
+		}
+
+		if len(decrypted) != nw {
+			err = io.ErrShortWrite
 			break
 		}
 	}

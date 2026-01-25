@@ -6,17 +6,16 @@ import (
 	stdlog "log"
 	"net/http"
 	"os"
-	"runtime/debug"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/zijiren233/gwst/compat"
 	"github.com/zijiren233/gwst/internal/config"
 	"github.com/zijiren233/gwst/internal/crypto"
+	"github.com/zijiren233/gwst/internal/utils"
 )
 
 func init() {
-	debug.SetGCPercent(20)
 	initLogger()
 }
 
@@ -69,26 +68,29 @@ func main() {
 }
 
 func run(endpoint config.Endpoint) {
-	var s server
+	for {
+		var s server
 
-	if endpoint.IsClient {
-		s = newClient(endpoint)
-	} else {
-		s = newServer(endpoint)
-	}
-	defer func() {
-		if err := s.Close(); err != nil {
-			log.Errorf("Error closing %s: %v", endpoint.ListenAddr, err)
+		if endpoint.IsClient {
+			s = newClient(endpoint)
+		} else {
+			s = newServer(endpoint)
 		}
-	}()
+		// 使用匿名函数确保Close在每次迭代结束时执行
+		func() {
+			defer func() {
+				if err := s.Close(); err != nil {
+					log.Errorf("Error closing %s: %v", endpoint.ListenAddr, err)
+				}
+			}()
 
-	err := s.Serve()
-	if err != nil {
-		log.Errorf("Error serving %s: %v", endpoint.ListenAddr, err)
-		log.Warnf("Restarting %s in 3 seconds...", endpoint.ListenAddr)
-		time.AfterFunc(time.Second*3, func() {
-			run(endpoint)
-		})
+			err := s.Serve()
+			if err != nil {
+				log.Errorf("Error serving %s: %v", endpoint.ListenAddr, err)
+				log.Warnf("Restarting %s in 3 seconds...", endpoint.ListenAddr)
+				time.Sleep(time.Second * 3)
+			}
+		}()
 	}
 }
 
@@ -231,18 +233,13 @@ func newClient(endpoint config.Endpoint) *compat.Forwarder {
 		compat.WithLogger(log.StandardLogger()),
 	}
 
-	// encryption_key 独立处理数据加密
+	// encryption_key 独立处理数据加密（通过 ConnectOption 下发到 Dialer）
 	if endpoint.EncryptionKey != "" {
 		if len(endpoint.EncryptionKey) < crypto.KeySize {
 			log.Errorf("encryption_key length (%d) < %d bytes, encryption disabled", len(endpoint.EncryptionKey), crypto.KeySize)
 		} else {
-			cryptoManager, err := crypto.NewManager([]byte(endpoint.EncryptionKey[:crypto.KeySize]))
-			if err != nil {
-				log.Warnf("Failed to create crypto manager: %v, encryption disabled", err)
-			} else {
-				forwarderOpts = append(forwarderOpts, compat.WithCryptoManager(cryptoManager))
-				log.Infof("AEGIS-128L encryption enabled for client on %s", endpoint.ListenAddr)
-			}
+			opts = append(opts, compat.WithEncryptionKey(endpoint.EncryptionKey))
+			log.Infof("AEGIS-128L encryption enabled for client on %s", endpoint.ListenAddr)
 		}
 	}
 
@@ -285,4 +282,8 @@ func (da *dialerAdapter) DialUDP() (io.ReadWriteCloser, error) {
 
 func (da *dialerAdapter) DialUDPWithHeaders(headers http.Header) (io.ReadWriteCloser, error) {
 	return da.wsDialer.DialUDP(compat.WithAppendHeaders(headers))
+}
+
+func (da *dialerAdapter) CryptoManager() utils.CryptoManager {
+	return da.wsDialer.CryptoManager()
 }

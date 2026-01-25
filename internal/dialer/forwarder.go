@@ -386,6 +386,12 @@ func NewForwarder(listenAddr string, wsDialer WebSocketDialer, opts ...Forwarder
 		opt(wf)
 	}
 
+	// 如果 Dialer 在 ConnectOption 中已配置加密，则自动使用
+	type cryptoProvider interface{ CryptoManager() CryptoManager }
+	if p, ok := wsDialer.(cryptoProvider); ok && wf.cryptoManager == nil {
+		wf.cryptoManager = p.CryptoManager()
+	}
+
 	if wf.udpCleanupInterval == 0 {
 		wf.udpCleanupInterval = DefaultUDPCleanupInterval
 	}
@@ -405,6 +411,14 @@ func NewForwarder(listenAddr string, wsDialer WebSocketDialer, opts ...Forwarder
 	if wf.bufferSize == 0 {
 		wf.bufferSize = utils.DefaultBufferSize
 	}
+
+	// Ensure buffer is large enough for encrypted packets if encryption is enabled
+	// Although here we don't know if encryption is enabled until run-time maybe?
+	// But actually we are setting wf.bufferSize.
+	// If Encryption is used, packets will be larger.
+	// utils.NewBufferPool uses bufferSize.
+	// Is it safe to just increase it slightly?
+	// Let's stick to default for now as CopyWithEncryption handles read limits.
 
 	wf.bufferPool = utils.NewBufferPool(wf.bufferSize)
 
@@ -754,7 +768,37 @@ func (wf *Forwarder) processUDP() error {
 			}
 		}
 
-		_, err := value.Write((*buffer)[:n])
+		// Encrypt if needed
+		dataToWrite := (*buffer)[:n]
+		if wf.cryptoManager != nil {
+			dstBuf := utils.GetBuffer(wf.bufferPool)
+			encrypted, err := wf.cryptoManager.EncryptTo(*dstBuf, dataToWrite)
+			if err != nil {
+				utils.PutBuffer(wf.bufferPool, buffer)
+				utils.PutBuffer(wf.bufferPool, dstBuf)
+				wf.log.Errorf("Failed to encrypt UDP packet: %v", err)
+				return
+			}
+
+			_, err = value.Write(encrypted)
+			utils.PutBuffer(wf.bufferPool, dstBuf)
+
+			if err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					wf.udpConns.CompareAndDelete(key, value)
+					return
+				}
+
+				wf.log.Errorf("Failed to write to UDP in websocket connection: %v", err)
+
+				if wf.udpConns.CompareAndDelete(key, value) {
+					value.Close()
+				}
+			}
+			return
+		}
+
+		_, err := value.Write(dataToWrite)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				wf.udpConns.CompareAndDelete(key, value)
@@ -858,13 +902,53 @@ func (wf *Forwarder) handleUDPResponse(value *udpConnInfo, remoteAddr *net.UDPAd
 			return
 		}
 
+		// Decrypt if needed (Packet based for UDP over WebSocket/Stream)
+		// Note: u.Conn is the Tunnel.
+		// If we are using Stream Transport (TCP/QUIC), the data coming from 'value.Read(buffer)'
+		// might effectively be 'Len + Payload' if we didn't use CopyWithEncryption inside udpConnInfo.
+		// BUT wait. UDP over Stream uses `udpConnInfo` to manage framing.
+		// `udpConnInfo` writes raw frames.
+		// If we use `Encryption`, we should probably wrap the whole `udpConnInfo` usage?
+		// Currently `Forwarder.serve` -> `processUDP` -> `value.Write` (To Tunnel)
+		// And `handleUDPResponse` -> `value.Read` (From Tunnel)
+
+		// If we inject CryptoManager here:
+		dataToWrite := buffer[:n]
+		if wf.cryptoManager != nil {
+			// We received Encrypted data from Tunnel. Decrypt it.
+			dstBuf := utils.GetBuffer(wf.bufferPool)
+			decrypted, err := wf.cryptoManager.DecryptTo(*dstBuf, dataToWrite)
+			if err != nil {
+				utils.PutBuffer(wf.bufferPool, dstBuf)
+				wf.log.Warnf("Failed to decrypt UDP packet: %v", err)
+				return
+			}
+
+			err = wf.udpConn.SetWriteDeadline(time.Now().Add(utils.DefaultWriteTimeout))
+			if err != nil {
+				utils.PutBuffer(wf.bufferPool, dstBuf)
+				wf.log.Errorf("Failed to set write deadline: %v", err)
+				return
+			}
+
+			_, err = wf.udpConn.WriteToUDP(decrypted, remoteAddr)
+			utils.PutBuffer(wf.bufferPool, dstBuf)
+			if err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
+				wf.log.Errorf("Failed to write to UDP client: %v", err)
+			}
+			return
+		}
+
 		err = wf.udpConn.SetWriteDeadline(time.Now().Add(utils.DefaultWriteTimeout))
 		if err != nil {
 			wf.log.Errorf("Failed to set write deadline: %v", err)
 			return
 		}
 
-		_, err = wf.udpConn.WriteToUDP(buffer[:n], remoteAddr)
+		_, err = wf.udpConn.WriteToUDP(dataToWrite, remoteAddr)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return

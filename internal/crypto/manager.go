@@ -134,7 +134,8 @@ func (m *Manager) EncryptTo(dst, plaintext []byte) ([]byte, error) {
 	copy(dst[:NonceSize], nonce)
 
 	// 在目标缓冲区中加密（从第 NonceSize 个位置开始）
-	ciphertext := m.aead.Seal(dst[:NonceSize:NonceSize], nonce, plaintext, nil)
+	// 注意：使用 dst[:NonceSize] 而不是 dst[:NonceSize:NonceSize] 以允许 append 利用后续容量
+	ciphertext := m.aead.Seal(dst[:NonceSize], nonce, plaintext, nil)
 
 	// 立即归还 nonce 缓冲区
 	noncePool.Put(noncePtr)

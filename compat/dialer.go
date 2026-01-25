@@ -15,7 +15,9 @@ import (
 	"time"
 
 	tls "github.com/refraction-networking/utls"
+	"github.com/zijiren233/gwst/internal/crypto"
 	"github.com/zijiren233/gwst/internal/transport"
+	"github.com/zijiren233/gwst/internal/utils"
 	"golang.org/x/net/websocket"
 )
 
@@ -62,6 +64,8 @@ type ConnectDialConfig struct {
 	UDP           bool
 	LoadBalance   bool
 	TransportType string // \"websocket\", \"tcp\", or \"quic\"
+	// 可选的加密管理器（当配置了 encryption_key 时自动创建）
+	CryptoManager utils.CryptoManager
 }
 
 type splitedConnectDialConfig struct {
@@ -189,6 +193,22 @@ func WithAppendHeaders(headers http.Header) ConnectOption {
 func WithHeaders(headers http.Header) ConnectOption {
 	return func(c *ConnectConfig) {
 		c.Headers = headers
+	}
+}
+
+// WithEncryptionKey 在连接配置中启用加密（使用 AEGIS-128L）
+// key 需至少 16 字节，仅取前 16 字节作为密钥
+func WithEncryptionKey(key string) ConnectOption {
+	return func(c *ConnectConfig) {
+		if len(key) < crypto.KeySize {
+			// 无效密钥长度：忽略加密设置
+			return
+		}
+		cm, err := crypto.NewManager([]byte(key[:crypto.KeySize]))
+		if err != nil {
+			return
+		}
+		c.CryptoManager = cm
 	}
 }
 
@@ -559,6 +579,11 @@ func (wc *Dialer) DialTCP(options ...ConnectOption) (net.Conn, error) {
 
 func (wc *Dialer) DialContextTCP(ctx context.Context, options ...ConnectOption) (net.Conn, error) {
 	return wc.DialContext(ctx, "tcp", options...)
+}
+
+// CryptoManager 返回在 ConnectOption 中配置的加密管理器（若未配置则为 nil）
+func (wc *Dialer) CryptoManager() utils.CryptoManager {
+	return wc.config.ConnectDialConfig.CryptoManager
 }
 
 // connectWithTransport 使用 transport 包进行连接（TCP 或 QUIC）
