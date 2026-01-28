@@ -3,7 +3,9 @@ package utils
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 )
@@ -12,6 +14,10 @@ const (
 	DefaultWriteTimeout = 15 * time.Second
 	// DefaultBufferSize 默认缓冲区大小 16KB
 	DefaultBufferSize = 16 * 1024
+	// MaxUDPSize UDP 最大数据包大小
+	MaxUDPSize = 65535
+	// UDPBufferSize 包含加密开销的 UDP 缓冲区大小 (65535 + 32 + 2)
+	UDPBufferSize = MaxUDPSize + 64
 )
 
 // DeadlineWriter 接口用于支持写入期限的 io.Writer
@@ -35,8 +41,11 @@ var sharedBufferPool = sync.Pool{
 	},
 }
 
-// cryptoOverhead AEGIS-128L 加密开销 (nonce + tag) + 2字节长度头
-const cryptoOverhead = 32 + 2
+// cryptoOverhead AEGIS-128L 加密开销 (nonce + tag)
+const cryptoOverhead = 32
+
+// udpHeaderSize UDP 帧头大小 (2字节长度)
+const udpHeaderSize = 2
 
 // encryptBufferPool 用于加密缓冲区复用（16KB + 34字节开销）
 var encryptBufferPool = sync.Pool{
@@ -68,13 +77,18 @@ func NewBufferPool(size int) *sync.Pool {
 	}
 }
 
-// GetBuffer retrieves a buffer from the pool and resets it to full capacity
+// GetBuffer retrieves a buffer from the pool and resets it to full capacity.
+// It ensures the returned buffer has at least DefaultBufferSize capacity.
 func GetBuffer(pool *sync.Pool) *[]byte {
 	buffer := pool.Get().(*[]byte)
-	// Reset slice to use full capacity
-	if buffer != nil && cap(*buffer) > 0 {
-		*buffer = (*buffer)[:cap(*buffer)]
+	// If the buffer was shrunk (e.g. by internal library behavior), discard it and reallocate.
+	// We use DefaultBufferSize (16KB) as the minimum acceptable capacity for any pooled buffer.
+	if buffer == nil || cap(*buffer) < DefaultBufferSize {
+		newBuf := make([]byte, DefaultBufferSize)
+		return &newBuf
 	}
+	// Reset slice to use full available capacity
+	*buffer = (*buffer)[:cap(*buffer)]
 	return buffer
 }
 
@@ -327,4 +341,33 @@ func CopyWithDecryption(
 	}
 
 	return written, err
+}
+
+// IsStreamConn 检查连接是否是流式连接（TCP/QUIC），而不是 WebSocket
+func IsStreamConn(conn any) bool {
+	if conn == nil {
+		return false
+	}
+	typeName := strings.ToLower(fmt.Sprintf("%T", conn))
+	return !strings.Contains(typeName, "websocket")
+}
+
+// LockedWriter wraps a DeadlineWriter with a mutex to ensure thread-safe writes.
+type LockedWriter struct {
+	W  DeadlineWriter
+	Mu *sync.Mutex
+}
+
+func (w *LockedWriter) Write(p []byte) (int, error) {
+	w.Mu.Lock()
+	n, err := w.W.Write(p)
+	w.Mu.Unlock()
+	return n, err
+}
+
+func (w *LockedWriter) SetWriteDeadline(t time.Time) error {
+	w.Mu.Lock()
+	err := w.W.SetWriteDeadline(t)
+	w.Mu.Unlock()
+	return err
 }

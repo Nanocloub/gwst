@@ -40,8 +40,8 @@ var noncePool = sync.Pool{
 
 // Manager handles AEGIS-128L encryption and decryption
 type Manager struct {
-	aead cipher.AEAD
-	key  []byte
+	key      []byte
+	aeadPool sync.Pool
 }
 
 // NewManager creates a new crypto manager with AEGIS-128L
@@ -50,18 +50,20 @@ func NewManager(key []byte) (*Manager, error) {
 		return nil, ErrInvalidKeySize
 	}
 
-	// Use 16-byte tag length
-	aead, err := aegis128l.New(key, TagSize)
-	if err != nil {
+	// Test creating one to ensure key/tag compatibility
+	if _, err := aegis128l.New(key, TagSize); err != nil {
 		return nil, err
 	}
 
-	cm := &Manager{
-		aead: aead,
-		key:  key,
+	m := &Manager{
+		key: key,
+	}
+	m.aeadPool.New = func() any {
+		aead, _ := aegis128l.New(key, TagSize)
+		return aead
 	}
 
-	return cm, nil
+	return m, nil
 }
 
 // Encrypt encrypts plaintext using AEGIS-128L
@@ -84,7 +86,9 @@ func (m *Manager) Encrypt(plaintext []byte) ([]byte, error) {
 	resultBuf = append(resultBuf, nonce...)
 
 	// 在结果缓冲区中加密（从第 NonceSize 个位置开始）
-	ciphertext := m.aead.Seal(resultBuf, nonce, plaintext, nil)
+	aead := m.aeadPool.Get().(cipher.AEAD)
+	ciphertext := aead.Seal(resultBuf, nonce, plaintext, nil)
+	m.aeadPool.Put(aead)
 
 	// 立即归还 nonce 缓冲区，不等待函数返回
 	noncePool.Put(noncePtr)
@@ -103,7 +107,9 @@ func (m *Manager) Decrypt(ciphertext []byte) ([]byte, error) {
 	nonce := ciphertext[:NonceSize]
 
 	// Decrypt and verify
-	plaintext, err := m.aead.Open(nil, nonce, ciphertext[NonceSize:], nil)
+	aead := m.aeadPool.Get().(cipher.AEAD)
+	plaintext, err := aead.Open(nil, nonce, ciphertext[NonceSize:], nil)
+	m.aeadPool.Put(aead)
 	if err != nil {
 		return nil, ErrDecryptionFailed
 	}
@@ -134,8 +140,9 @@ func (m *Manager) EncryptTo(dst, plaintext []byte) ([]byte, error) {
 	copy(dst[:NonceSize], nonce)
 
 	// 在目标缓冲区中加密（从第 NonceSize 个位置开始）
-	// 注意：使用 dst[:NonceSize] 而不是 dst[:NonceSize:NonceSize] 以允许 append 利用后续容量
-	ciphertext := m.aead.Seal(dst[:NonceSize], nonce, plaintext, nil)
+	aead := m.aeadPool.Get().(cipher.AEAD)
+	ciphertext := aead.Seal(dst[:NonceSize], nonce, plaintext, nil)
+	m.aeadPool.Put(aead)
 
 	// 立即归还 nonce 缓冲区
 	noncePool.Put(noncePtr)
@@ -160,7 +167,9 @@ func (m *Manager) DecryptTo(dst, ciphertext []byte) ([]byte, error) {
 	nonce := ciphertext[:NonceSize]
 
 	// Decrypt and verify
-	plaintext, err := m.aead.Open(dst[:0], nonce, ciphertext[NonceSize:], nil)
+	aead := m.aeadPool.Get().(cipher.AEAD)
+	plaintext, err := aead.Open(dst[:0], nonce, ciphertext[NonceSize:], nil)
+	m.aeadPool.Put(aead)
 	if err != nil {
 		return nil, ErrDecryptionFailed
 	}

@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,6 +16,7 @@ import (
 	"github.com/zijiren233/gencontainer/rwmap"
 
 	"github.com/zijiren233/gwst/internal/utils"
+	"golang.org/x/net/websocket"
 )
 
 const (
@@ -56,10 +56,24 @@ var frameBufferPool = sync.Pool{
 }
 
 func getUDPConnInfo() *udpConnInfo {
-	return sharedUDPConnInfoPool.Get().(*udpConnInfo)
+	u := sharedUDPConnInfoPool.Get().(*udpConnInfo)
+	// Reset state for reuse
+	u.Conn = nil
+	u.dialErr = nil
+	u.remoteAddr = nil
+	u.setUpDone = make(chan struct{})
+	u.setUpDoneOnce = sync.Once{}
+	u.closed.Store(false)
+	u.forwarder = nil
+	u.framingCached.Store(false)
+	return u
 }
 
 func putUDPConnInfo(u *udpConnInfo) {
+	// Clear references to help GC
+	u.Conn = nil
+	u.remoteAddr = nil
+	u.forwarder = nil
 	sharedUDPConnInfoPool.Put(u)
 }
 
@@ -75,6 +89,7 @@ type udpConnInfo struct {
 	forwarder     *Forwarder
 	needsFraming  bool        // 缓存是否需要帧封装的判断结果
 	framingCached atomic.Bool // 标记是否已缓存
+	writeLock     sync.Mutex  // 确保 WebSocket 写入原子性
 }
 
 func (u *udpConnInfo) Close() error {
@@ -124,6 +139,8 @@ func (u *udpConnInfo) Setup() (net.Conn, error) {
 			return nil, u.dialErr
 		}
 		u.Conn = conn.(net.Conn)
+		u.needsFraming = isStreamConn(u.Conn)
+		u.framingCached.Store(true)
 		return u.Conn, nil
 	}
 
@@ -155,8 +172,19 @@ func (u *udpConnInfo) SetupWithEarlyData(
 
 	// Create a stub dial - actual implementation would be in wsc.go
 	if u.forwarder != nil && u.forwarder.wsDialer != nil {
+		// Encrypt early data if encryption is enabled
+		dataToEncode := earlyData
+		if u.forwarder.cryptoManager != nil {
+			encrypted, err := u.forwarder.cryptoManager.Encrypt(dataToEncode)
+			if err != nil {
+				u.dialErr = fmt.Errorf("failed to encrypt early data: %w", err)
+				return nil, u.dialErr
+			}
+			dataToEncode = encrypted
+		}
+
 		headers := http.Header{}
-		headers.Set(earlyDataHeaderName, base64.StdEncoding.EncodeToString(earlyData))
+		headers.Set(earlyDataHeaderName, base64.StdEncoding.EncodeToString(dataToEncode))
 
 		conn, err := u.forwarder.wsDialer.DialUDPWithHeaders(headers)
 		if err != nil {
@@ -219,14 +247,11 @@ func (u *udpConnInfo) Write(b []byte) (int, error) {
 		return 0, err
 	}
 
-	// 检查是否需要帧封装（TCP/QUIC 传输），首次判断后缓存结果
-	if !u.framingCached.Load() {
-		u.needsFraming = isStreamConn(conn)
-		u.framingCached.Store(true)
-	}
+	// 检查是否需要帧封装（TCP/QUIC 传输模式），结果在 Setup 时已缓存
+	needsFraming := u.needsFraming
 
 	var n int
-	if u.needsFraming {
+	if needsFraming {
 		// 写入帧长度（2字节）+ 数据，使用单次 Write 减少系统调用
 		if len(b) > 65535 {
 			return 0, fmt.Errorf("UDP packet too large: %d bytes (max 65535)", len(b))
@@ -237,7 +262,10 @@ func (u *udpConnInfo) Write(b []byte) (int, error) {
 		frame[0] = byte(len(b) >> 8)
 		frame[1] = byte(len(b) & 0xff)
 		copy(frame[2:], b)
+		// 返回实际数据长度，不包括帧头
+		u.writeLock.Lock()
 		n, err = conn.Write(frame[:2+len(b)])
+		u.writeLock.Unlock()
 		// 立即归还到池中
 		frameBufferPool.Put(framePtr)
 		if err != nil {
@@ -247,7 +275,9 @@ func (u *udpConnInfo) Write(b []byte) (int, error) {
 		n = len(b)
 	} else {
 		// WebSocket 模式：直接写入
+		u.writeLock.Lock()
 		n, err = conn.Write(b)
+		u.writeLock.Unlock()
 	}
 
 	if err != nil {
@@ -415,10 +445,9 @@ func NewForwarder(listenAddr string, wsDialer WebSocketDialer, opts ...Forwarder
 	// Ensure buffer is large enough for encrypted packets if encryption is enabled
 	// Although here we don't know if encryption is enabled until run-time maybe?
 	// But actually we are setting wf.bufferSize.
-	// If Encryption is used, packets will be larger.
-	// utils.NewBufferPool uses bufferSize.
-	// Is it safe to just increase it slightly?
-	// Let's stick to default for now as CopyWithEncryption handles read limits.
+	if wf.bufferSize < utils.UDPBufferSize {
+		wf.bufferSize = utils.UDPBufferSize
+	}
 
 	wf.bufferPool = utils.NewBufferPool(wf.bufferSize)
 
@@ -735,7 +764,21 @@ func (wf *Forwarder) processUDP() error {
 
 		value, loaded := wf.udpConns.LoadOrStore(key, connInfo)
 		if !loaded {
-			if !wf.disableUDPEarlyData && n <= wf.udpMaxEarlyDataSize {
+			if wf.cryptoManager != nil && n <= wf.udpMaxEarlyDataSize {
+				// Handle First Packet / Early Data
+				dataCopy := make([]byte, n)
+				copy(dataCopy, (*buffer)[:n])
+				go func() {
+					_, err := value.SetupWithEarlyData(dataCopy, DefaultUDPEarlyDataHeaderName)
+					if err != nil {
+						wf.log.Errorf("Failed to setup UDP connection with early data: %v", err)
+						wf.udpConns.Delete(key)
+						return
+					}
+					go wf.handleUDPResponse(value, remoteAddr)
+				}()
+				return
+			} else if !wf.disableUDPEarlyData && n <= wf.udpMaxEarlyDataSize {
 				if _, err := value.SetupWithEarlyData((*buffer)[:n], wf.udpEarlyDataHeaderName); err != nil {
 					wf.log.Errorf("Failed to setup new UDP in websocket connection: %v", err)
 					wf.udpConns.CompareAndDelete(key, value)
@@ -843,6 +886,7 @@ func (wf *Forwarder) handleUDPResponse(value *udpConnInfo, remoteAddr *net.UDPAd
 		if wf.udpConns.CompareAndDelete(remoteAddr.String(), value) {
 			value.Close()
 		}
+		putUDPConnInfo(value)
 	}()
 
 	buffer := *bufferP
@@ -886,8 +930,24 @@ func (wf *Forwarder) handleUDPResponse(value *udpConnInfo, remoteAddr *net.UDPAd
 			// 读取帧数据
 			n, err = io.ReadFull(value.Conn, buffer[:frameLen])
 		} else {
-			// WebSocket 模式：直接读取
-			n, err = value.Read(buffer)
+			// WebSocket 模式：使用 Message.Receive 确保读到完整消息
+			ws, ok := value.Conn.(*websocket.Conn)
+			if ok {
+				var message []byte
+				err = websocket.Message.Receive(ws, &message)
+				if err == nil {
+					n = len(message)
+					// Copy message to our pooled buffer
+					if n > cap(buffer) {
+						// This shouldn't happen with pooled 65KB buffers
+						buffer = make([]byte, n)
+					}
+					n = copy(buffer, message)
+				}
+			} else {
+				// Fallback to Read if for some reason it's not a *websocket.Conn
+				n, err = value.Read(buffer)
+			}
 		}
 
 		if err != nil {
@@ -917,11 +977,16 @@ func (wf *Forwarder) handleUDPResponse(value *udpConnInfo, remoteAddr *net.UDPAd
 		if wf.cryptoManager != nil {
 			// We received Encrypted data from Tunnel. Decrypt it.
 			dstBuf := utils.GetBuffer(wf.bufferPool)
+			if n < 32 {
+				wf.log.Warnf("Received truncated response packet (size=%d), dropping", n)
+				continue
+			}
+
 			decrypted, err := wf.cryptoManager.DecryptTo(*dstBuf, dataToWrite)
 			if err != nil {
 				utils.PutBuffer(wf.bufferPool, dstBuf)
-				wf.log.Warnf("Failed to decrypt UDP packet: %v", err)
-				return
+				wf.log.Warnf("Failed to decrypt UDP packet (n=%d): %v", n, err)
+				continue
 			}
 
 			err = wf.udpConn.SetWriteDeadline(time.Now().Add(utils.DefaultWriteTimeout))
@@ -939,39 +1004,28 @@ func (wf *Forwarder) handleUDPResponse(value *udpConnInfo, remoteAddr *net.UDPAd
 				}
 				wf.log.Errorf("Failed to write to UDP client: %v", err)
 			}
-			return
-		}
-
-		err = wf.udpConn.SetWriteDeadline(time.Now().Add(utils.DefaultWriteTimeout))
-		if err != nil {
-			wf.log.Errorf("Failed to set write deadline: %v", err)
-			return
-		}
-
-		_, err = wf.udpConn.WriteToUDP(dataToWrite, remoteAddr)
-		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
+		} else {
+			err = wf.udpConn.SetWriteDeadline(time.Now().Add(utils.DefaultWriteTimeout))
+			if err != nil {
+				wf.log.Errorf("Failed to set write deadline: %v", err)
 				return
 			}
 
-			wf.log.Errorf("Failed to write to UDP: %v", err)
+			_, err = wf.udpConn.WriteToUDP(dataToWrite, remoteAddr)
+			if err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
 
-			return
+				wf.log.Errorf("Failed to write to UDP: %v", err)
+
+				return
+			}
 		}
 	}
 }
 
 // isStreamConn 检查连接是否是流式连接（TCP/QUIC），而不是 WebSocket
 func isStreamConn(conn net.Conn) bool {
-	// TCP/QUIC 连接会是 *net.TCPConn 或 *tls.Conn 包装的 TCPConn
-	// WebSocket 连接类型名包含 "websocket" 或 "Conn"（指 websocket.Conn）
-	switch conn.(type) {
-	case *net.TCPConn:
-		return true
-	default:
-		// 检查类型名，WebSocket 连接通常包含 "websocket"
-		typeName := fmt.Sprintf("%T", conn)
-		// 使用 strings.Contains 更高效
-		return !strings.Contains(strings.ToLower(typeName), "websocket")
-	}
+	return utils.IsStreamConn(conn)
 }

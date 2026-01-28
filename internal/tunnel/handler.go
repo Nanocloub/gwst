@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	DefaultUDPDialReadTimeout     = time.Second / 2
+	DefaultUDPDialReadTimeout     = time.Second * 2
 	DefaultUDPEarlyDataHeaderName = "Sec-WebSocket-Protocol"
 	DefaultUDPMaxEarlyDataSize    = 4 * 1024
 )
@@ -190,7 +190,7 @@ func NewHandler(opts ...HandlerOption) *Handler {
 		h.bufferSize = utils.DefaultBufferSize
 	}
 
-	h.bufferPool = utils.NewBufferPool(h.bufferSize)
+	h.bufferPool = utils.NewBufferPool(utils.UDPBufferSize)
 
 	if h.udpDialReadTimeout == 0 {
 		h.udpDialReadTimeout = DefaultUDPDialReadTimeout
@@ -329,25 +329,6 @@ var pingCodec = websocket.Codec{
 	},
 }
 
-type lockedWriter struct {
-	w  deadlineWriter
-	mu *sync.Mutex
-}
-
-func (w *lockedWriter) Write(p []byte) (int, error) {
-	w.mu.Lock()
-	n, err := w.w.Write(p)
-	w.mu.Unlock()
-	return n, err
-}
-
-func (w *lockedWriter) SetWriteDeadline(t time.Time) error {
-	w.mu.Lock()
-	err := w.w.SetWriteDeadline(t)
-	w.mu.Unlock()
-	return err
-}
-
 func (h *Handler) handle(ws *websocket.Conn, network, addr string, fallbackAddrs []string) {
 	exit := make(chan struct{})
 	defer close(exit)
@@ -411,8 +392,9 @@ func (h *Handler) handleUDP(ws *websocket.Conn, addr string, fallbackAddrs []str
 
 	base64Str := ws.Request().Header.Get(h.udpEarlyDataHeaderName)
 	if base64Str != "" {
-		if base64.StdEncoding.DecodedLen(len(base64Str)) > len(*buffer) {
-			h.log.Errorf("X-0RTT header too large")
+		decodedLen := base64.StdEncoding.DecodedLen(len(base64Str))
+		if decodedLen > len(*buffer) {
+			h.log.Errorf("X-0RTT header too large: %d bytes (buffer: %d)", decodedLen, len(*buffer))
 			return
 		}
 		n, err = base64.StdEncoding.Decode(*buffer, utils.StringToBytes(base64Str))
@@ -420,31 +402,50 @@ func (h *Handler) handleUDP(ws *websocket.Conn, addr string, fallbackAddrs []str
 			h.log.Errorf("Failed to decode X-0RTT header: %v", err)
 			return
 		}
-	} else {
-		err = ws.SetReadDeadline(time.Now().Add(time.Second))
-		if err != nil {
-			h.log.Errorf("Failed to set read deadline: %v", err)
-			return
-		}
 
-		n, err = ws.Read(*buffer)
-		if err != nil {
-			h.log.Errorf("Failed to read from tunnel connection: %v", err)
-			return
-		}
-
+		// Decrypt early data if encryption is enabled
 		if h.cryptoManager != nil {
-			// Acquire a temporary buffer for decryption to avoid allocation
 			dstBuf := utils.GetBuffer(h.bufferPool)
-			decrypted, err := h.cryptoManager.DecryptTo(*dstBuf, *buffer)
+			decrypted, err := h.cryptoManager.DecryptTo(*dstBuf, (*buffer)[:n])
 			if err != nil {
 				utils.PutBuffer(h.bufferPool, dstBuf)
-				h.log.Errorf("Failed to decrypt X-0RTT/First packet: %v", err)
+				h.log.Errorf("Failed to decrypt X-0RTT header: %v", err)
 				return
 			}
 			// Copy decrypted data back to buffer
 			n = copy(*buffer, decrypted)
 			utils.PutBuffer(h.bufferPool, dstBuf)
+		}
+	} else {
+		err = ws.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if err != nil {
+			h.log.Errorf("Failed to set read deadline: %v", err)
+			return
+		}
+
+		var message []byte
+		err = websocket.Message.Receive(ws, &message)
+		if err != nil {
+			h.log.Errorf("Failed to read from tunnel connection: %v", err)
+			return
+		}
+		n = len(message)
+
+		if h.cryptoManager != nil {
+			// Acquire a temporary buffer for decryption to avoid allocation
+			dstBuf := utils.GetBuffer(h.bufferPool)
+			decrypted, err := h.cryptoManager.DecryptTo(*dstBuf, message)
+			if err != nil {
+				utils.PutBuffer(h.bufferPool, dstBuf)
+				h.log.Errorf("Failed to decrypt X-0RTT/First packet (size=%d): %v", n, err)
+				return
+			}
+			// Copy decrypted data back to buffer for original processing logic
+			n = copy(*buffer, decrypted)
+			utils.PutBuffer(h.bufferPool, dstBuf)
+		} else {
+			// Without encryption, copy message to buffer
+			n = copy(*buffer, message)
 		}
 
 		err = ws.SetReadDeadline(time.Time{})
@@ -509,29 +510,36 @@ func (h *Handler) handleUDP(ws *websocket.Conn, addr string, fallbackAddrs []str
 
 		if h.cryptoManager != nil {
 			// Custom loop for Encrypted Message based UDP
-			buf := *readBuffer
-			dstBuf := utils.GetBuffer(h.bufferPool)
-			defer utils.PutBuffer(h.bufferPool, dstBuf)
-
 			for {
-				n, err := ws.Read(buf)
+				var message []byte
+				err := websocket.Message.Receive(ws, &message)
 				if err != nil {
 					if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
 						h.log.Infof("Failed to read from Tunnel: %v", err)
 					}
 					return
 				}
+				n := len(message)
 
-				decrypted, err := h.cryptoManager.DecryptTo(*dstBuf, buf[:n])
+				if n < 32 {
+					h.log.Warnf("Received truncated UDP packet (size=%d), dropping", n)
+					continue
+				}
+
+				dstBuf := utils.GetBuffer(h.bufferPool)
+				decrypted, err := h.cryptoManager.DecryptTo(*dstBuf, message)
 				if err != nil {
-					h.log.Warnf("Failed to decrypt UDP packet: %v", err)
-					return
+					utils.PutBuffer(h.bufferPool, dstBuf)
+					h.log.Warnf("Failed to decrypt UDP packet (n=%d): %v", n, err)
+					continue
 				}
 
 				if _, err := conn.Write(decrypted); err != nil {
+					utils.PutBuffer(h.bufferPool, dstBuf)
 					h.log.Infof("Failed to write to Target: %v", err)
 					return
 				}
+				utils.PutBuffer(h.bufferPool, dstBuf)
 			}
 		} else {
 			if _, err := utils.CopyBufferWithWriteTimeout(conn, ws, *readBuffer, utils.DefaultWriteTimeout); err != nil &&
@@ -541,14 +549,11 @@ func (h *Handler) handleUDP(ws *websocket.Conn, addr string, fallbackAddrs []str
 		}
 	}()
 
-	lockedWs := &lockedWriter{w: ws, mu: writeMu}
+	lockedWs := &utils.LockedWriter{W: ws, Mu: writeMu}
 
 	if h.cryptoManager != nil {
 		// Custom loop for Target(UDP) -> Encrypt -> WS(Tunnel)
 		buf := *buffer
-		dstBuf := utils.GetBuffer(h.bufferPool)
-		defer utils.PutBuffer(h.bufferPool, dstBuf)
-
 		for {
 			n, err := conn.Read(buf)
 			if err != nil {
@@ -558,18 +563,22 @@ func (h *Handler) handleUDP(ws *websocket.Conn, addr string, fallbackAddrs []str
 				return
 			}
 
+			dstBuf := utils.GetBuffer(h.bufferPool)
 			// We must encrypt before protecting with lock?
 			// Ideally yes, but we need to write to lockedWs.
 			encrypted, err := h.cryptoManager.EncryptTo(*dstBuf, buf[:n])
 			if err != nil {
+				utils.PutBuffer(h.bufferPool, dstBuf)
 				h.log.Warnf("Failed to encrypt UDP packet: %v", err)
 				return
 			}
 
 			if _, err := lockedWs.Write(encrypted); err != nil {
+				utils.PutBuffer(h.bufferPool, dstBuf)
 				h.log.Infof("Failed to write to Tunnel: %v", err)
 				return
 			}
+			utils.PutBuffer(h.bufferPool, dstBuf)
 		}
 	} else {
 		if _, err := utils.CopyBufferWithWriteTimeout(lockedWs, conn, *buffer, utils.DefaultWriteTimeout); err != nil &&
@@ -609,7 +618,7 @@ func (h *Handler) handleNetwork(ws *websocket.Conn, network, addr string, fallba
 	buffer := utils.GetBuffer(h.bufferPool)
 	defer utils.PutBuffer(h.bufferPool, buffer)
 
-	lockedWs := &lockedWriter{w: ws, mu: writeMu}
+	lockedWs := &utils.LockedWriter{W: ws, Mu: writeMu}
 
 	// Direction: Target(conn) -> Tunnel(ws)
 	// We read Plain from Target, Encrypt, Write Encrypted stream to Tunnel.
@@ -894,11 +903,17 @@ func (h *Handler) handleRawUDP(conn net.Conn, addr string, fallbackAddrs []strin
 			if h.cryptoManager != nil {
 				// Use a temporary buffer for decryption
 				dstBuf := utils.GetBuffer(h.bufferPool)
+				if frameLen < 32 {
+					utils.PutBuffer(h.bufferPool, dstBuf)
+					h.log.Warnf("Received truncated UDP packet (size=%d), dropping", frameLen)
+					continue
+				}
+
 				decrypted, err := h.cryptoManager.DecryptTo(*dstBuf, dataToWrite)
 				if err != nil {
 					utils.PutBuffer(h.bufferPool, dstBuf)
-					h.log.Warnf("Failed to decrypt UDP frame: %v", err)
-					return
+					h.log.Warnf("Failed to decrypt UDP frame (n=%d): %v", frameLen, err)
+					continue
 				}
 				// Write decrypted data to target
 				_, err = targetConn.Write(decrypted)
@@ -1011,4 +1026,8 @@ func (h *Handler) handleRawUDP(conn net.Conn, addr string, fallbackAddrs []strin
 
 	wg.Wait()
 	return nil
+}
+
+func isStreamConn(conn net.Conn) bool {
+	return utils.IsStreamConn(conn)
 }
