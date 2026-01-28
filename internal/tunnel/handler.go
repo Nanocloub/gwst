@@ -510,6 +510,7 @@ func (h *Handler) handleUDP(ws *websocket.Conn, addr string, fallbackAddrs []str
 
 		if h.cryptoManager != nil {
 			// Custom loop for Encrypted Message based UDP
+			var decryptDstBuf *[]byte
 			for {
 				var message []byte
 				err := websocket.Message.Receive(ws, &message)
@@ -526,20 +527,20 @@ func (h *Handler) handleUDP(ws *websocket.Conn, addr string, fallbackAddrs []str
 					continue
 				}
 
-				dstBuf := utils.GetBuffer(h.bufferPool)
-				decrypted, err := h.cryptoManager.DecryptTo(*dstBuf, message)
+				if decryptDstBuf == nil {
+					decryptDstBuf = utils.GetBuffer(h.bufferPool)
+					defer utils.PutBuffer(h.bufferPool, decryptDstBuf)
+				}
+				decrypted, err := h.cryptoManager.DecryptTo(*decryptDstBuf, message)
 				if err != nil {
-					utils.PutBuffer(h.bufferPool, dstBuf)
 					h.log.Warnf("Failed to decrypt UDP packet (n=%d): %v", n, err)
 					continue
 				}
 
 				if _, err := conn.Write(decrypted); err != nil {
-					utils.PutBuffer(h.bufferPool, dstBuf)
 					h.log.Infof("Failed to write to Target: %v", err)
 					return
 				}
-				utils.PutBuffer(h.bufferPool, dstBuf)
 			}
 		} else {
 			if _, err := utils.CopyBufferWithWriteTimeout(conn, ws, *readBuffer, utils.DefaultWriteTimeout); err != nil &&
@@ -554,6 +555,7 @@ func (h *Handler) handleUDP(ws *websocket.Conn, addr string, fallbackAddrs []str
 	if h.cryptoManager != nil {
 		// Custom loop for Target(UDP) -> Encrypt -> WS(Tunnel)
 		buf := *buffer
+		var encryptDstBuf *[]byte
 		for {
 			n, err := conn.Read(buf)
 			if err != nil {
@@ -563,22 +565,22 @@ func (h *Handler) handleUDP(ws *websocket.Conn, addr string, fallbackAddrs []str
 				return
 			}
 
-			dstBuf := utils.GetBuffer(h.bufferPool)
+			if encryptDstBuf == nil {
+				encryptDstBuf = utils.GetBuffer(h.bufferPool)
+				defer utils.PutBuffer(h.bufferPool, encryptDstBuf)
+			}
 			// We must encrypt before protecting with lock?
 			// Ideally yes, but we need to write to lockedWs.
-			encrypted, err := h.cryptoManager.EncryptTo(*dstBuf, buf[:n])
+			encrypted, err := h.cryptoManager.EncryptTo(*encryptDstBuf, buf[:n])
 			if err != nil {
-				utils.PutBuffer(h.bufferPool, dstBuf)
 				h.log.Warnf("Failed to encrypt UDP packet: %v", err)
 				return
 			}
 
 			if _, err := lockedWs.Write(encrypted); err != nil {
-				utils.PutBuffer(h.bufferPool, dstBuf)
 				h.log.Infof("Failed to write to Tunnel: %v", err)
 				return
 			}
-			utils.PutBuffer(h.bufferPool, dstBuf)
 		}
 	} else {
 		if _, err := utils.CopyBufferWithWriteTimeout(lockedWs, conn, *buffer, utils.DefaultWriteTimeout); err != nil &&
@@ -872,6 +874,7 @@ func (h *Handler) handleRawUDP(conn net.Conn, addr string, fallbackAddrs []strin
 		// 预分配 lenBuf，避免在循环中重复分配
 		var lenBuf [2]byte
 
+		var decryptDstBuf *[]byte
 		for {
 			// 读取帧长度（2字节）
 			if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
@@ -902,22 +905,23 @@ func (h *Handler) handleRawUDP(conn net.Conn, addr string, fallbackAddrs []strin
 			dataToWrite := (*buffer)[:frameLen]
 			if h.cryptoManager != nil {
 				// Use a temporary buffer for decryption
-				dstBuf := utils.GetBuffer(h.bufferPool)
+				if decryptDstBuf == nil {
+					decryptDstBuf = utils.GetBuffer(h.bufferPool)
+					defer utils.PutBuffer(h.bufferPool, decryptDstBuf)
+				}
+
 				if frameLen < 32 {
-					utils.PutBuffer(h.bufferPool, dstBuf)
 					h.log.Warnf("Received truncated UDP packet (size=%d), dropping", frameLen)
 					continue
 				}
 
-				decrypted, err := h.cryptoManager.DecryptTo(*dstBuf, dataToWrite)
+				decrypted, err := h.cryptoManager.DecryptTo(*decryptDstBuf, dataToWrite)
 				if err != nil {
-					utils.PutBuffer(h.bufferPool, dstBuf)
 					h.log.Warnf("Failed to decrypt UDP frame (n=%d): %v", frameLen, err)
 					continue
 				}
 				// Write decrypted data to target
 				_, err = targetConn.Write(decrypted)
-				utils.PutBuffer(h.bufferPool, dstBuf)
 				if err != nil {
 					if !errors.Is(err, net.ErrClosed) {
 						h.log.Infof("Failed to write to UDP target: %v", err)

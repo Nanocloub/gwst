@@ -47,13 +47,7 @@ var sharedUDPConnInfoPool = sync.Pool{
 	},
 }
 
-// frameBufferPool 用于复用 UDP 帧缓冲区（最大 65537 字节：2字节长度 + 65535字节数据）
-var frameBufferPool = sync.Pool{
-	New: func() any {
-		buf := make([]byte, 65537)
-		return &buf
-	},
-}
+var frameBufferPool = utils.NewBufferPool(65537)
 
 func getUDPConnInfo() *udpConnInfo {
 	u := sharedUDPConnInfoPool.Get().(*udpConnInfo)
@@ -257,7 +251,7 @@ func (u *udpConnInfo) Write(b []byte) (int, error) {
 			return 0, fmt.Errorf("UDP packet too large: %d bytes (max 65535)", len(b))
 		}
 		// 从池中获取帧缓冲区，避免频繁分配
-		framePtr := frameBufferPool.Get().(*[]byte)
+		framePtr := utils.GetBuffer(frameBufferPool)
 		frame := *framePtr
 		frame[0] = byte(len(b) >> 8)
 		frame[1] = byte(len(b) & 0xff)
@@ -267,7 +261,7 @@ func (u *udpConnInfo) Write(b []byte) (int, error) {
 		n, err = conn.Write(frame[:2+len(b)])
 		u.writeLock.Unlock()
 		// 立即归还到池中
-		frameBufferPool.Put(framePtr)
+		utils.PutBuffer(frameBufferPool, framePtr)
 		if err != nil {
 			return 0, err
 		}
@@ -436,6 +430,10 @@ func NewForwarder(listenAddr string, wsDialer WebSocketDialer, opts ...Forwarder
 
 	if wf.udpMaxEarlyDataSize == 0 {
 		wf.udpMaxEarlyDataSize = DefaultUDPMaxEarlyDataSize
+	}
+
+	if wf.udpPoolSize == 0 {
+		wf.udpPoolSize = DefaultUDPPoolSize
 	}
 
 	if wf.bufferSize == 0 {
@@ -755,7 +753,7 @@ func (wf *Forwarder) processUDP() error {
 		return fmt.Errorf("failed to read from UDP: %w", err)
 	}
 
-	err = wf.udpPool.Submit(func() {
+	if err := wf.udpPool.Submit(func() {
 		defer utils.PutBuffer(wf.bufferPool, buffer)
 
 		key := remoteAddr.String()
@@ -854,13 +852,9 @@ func (wf *Forwarder) processUDP() error {
 				value.Close()
 			}
 		}
-	})
-	if err != nil {
+	}); err != nil {
 		utils.PutBuffer(wf.bufferPool, buffer)
-
-		if errors.Is(err, ants.ErrPoolOverload) {
-			wf.log.Errorf("UDP pool is overloaded, dropping packet: %v", remoteAddr.String())
-		} else {
+		if !errors.Is(err, ants.ErrPoolOverload) {
 			wf.log.Errorf("Failed to submit UDP task: %v", err)
 		}
 	}
@@ -898,13 +892,14 @@ func (wf *Forwarder) handleUDPResponse(value *udpConnInfo, remoteAddr *net.UDPAd
 	}
 	needsFraming := value.needsFraming
 
-	// 预分配 lenBuf，避免在循环中重复分配
 	var lenBuf [2]byte
+	var decryptDstBuf *[]byte
 
 	for {
 		var n int
 		var err error
 
+		var dataToProcess []byte
 		if needsFraming {
 			// 读取帧长度（2字节）
 			if _, err := io.ReadFull(value.Conn, lenBuf[:]); err != nil {
@@ -929,6 +924,7 @@ func (wf *Forwarder) handleUDPResponse(value *udpConnInfo, remoteAddr *net.UDPAd
 
 			// 读取帧数据
 			n, err = io.ReadFull(value.Conn, buffer[:frameLen])
+			dataToProcess = buffer[:n]
 		} else {
 			// WebSocket 模式：使用 Message.Receive 确保读到完整消息
 			ws, ok := value.Conn.(*websocket.Conn)
@@ -937,16 +933,19 @@ func (wf *Forwarder) handleUDPResponse(value *udpConnInfo, remoteAddr *net.UDPAd
 				err = websocket.Message.Receive(ws, &message)
 				if err == nil {
 					n = len(message)
-					// Copy message to our pooled buffer
-					if n > cap(buffer) {
-						// This shouldn't happen with pooled 65KB buffers
-						buffer = make([]byte, n)
+					if wf.cryptoManager != nil {
+						dataToProcess = message
+					} else {
+						if n > cap(buffer) {
+							buffer = make([]byte, n)
+						}
+						n = copy(buffer, message)
+						dataToProcess = buffer[:n]
 					}
-					n = copy(buffer, message)
 				}
 			} else {
-				// Fallback to Read if for some reason it's not a *websocket.Conn
 				n, err = value.Read(buffer)
+				dataToProcess = buffer[:n]
 			}
 		}
 
@@ -973,31 +972,33 @@ func (wf *Forwarder) handleUDPResponse(value *udpConnInfo, remoteAddr *net.UDPAd
 		// And `handleUDPResponse` -> `value.Read` (From Tunnel)
 
 		// If we inject CryptoManager here:
-		dataToWrite := buffer[:n]
+		dataToWrite := dataToProcess
+		n = len(dataToWrite)
 		if wf.cryptoManager != nil {
 			// We received Encrypted data from Tunnel. Decrypt it.
-			dstBuf := utils.GetBuffer(wf.bufferPool)
+			if decryptDstBuf == nil {
+				decryptDstBuf = utils.GetBuffer(wf.bufferPool)
+				defer utils.PutBuffer(wf.bufferPool, decryptDstBuf)
+			}
+
 			if n < 32 {
 				wf.log.Warnf("Received truncated response packet (size=%d), dropping", n)
 				continue
 			}
 
-			decrypted, err := wf.cryptoManager.DecryptTo(*dstBuf, dataToWrite)
+			decrypted, err := wf.cryptoManager.DecryptTo(*decryptDstBuf, dataToWrite)
 			if err != nil {
-				utils.PutBuffer(wf.bufferPool, dstBuf)
 				wf.log.Warnf("Failed to decrypt UDP packet (n=%d): %v", n, err)
 				continue
 			}
 
 			err = wf.udpConn.SetWriteDeadline(time.Now().Add(utils.DefaultWriteTimeout))
 			if err != nil {
-				utils.PutBuffer(wf.bufferPool, dstBuf)
 				wf.log.Errorf("Failed to set write deadline: %v", err)
 				return
 			}
 
 			_, err = wf.udpConn.WriteToUDP(decrypted, remoteAddr)
-			utils.PutBuffer(wf.bufferPool, dstBuf)
 			if err != nil {
 				if errors.Is(err, net.ErrClosed) {
 					return

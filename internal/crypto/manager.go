@@ -30,14 +30,6 @@ var (
 	ErrDecryptionFailed = errors.New("decryption failed")
 )
 
-// nonce 池，复用 nonce 缓冲区减少内存分配
-var noncePool = sync.Pool{
-	New: func() any {
-		buf := make([]byte, NonceSize)
-		return &buf
-	},
-}
-
 // Manager handles AEGIS-128L encryption and decryption
 type Manager struct {
 	key      []byte
@@ -69,29 +61,20 @@ func NewManager(key []byte) (*Manager, error) {
 // Encrypt encrypts plaintext using AEGIS-128L
 // Returns: nonce + ciphertext + tag
 func (m *Manager) Encrypt(plaintext []byte) ([]byte, error) {
-	// 从池中获取 nonce 缓冲区
-	noncePtr := noncePool.Get().(*[]byte)
-	nonce := *noncePtr
-
-	// Generate random nonce
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		// 错误时也要归还缓冲区
-		noncePool.Put(noncePtr)
-		return nil, err
-	}
-
 	// 创建结果缓冲区，包含 nonce + ciphertext + tag
 	// 使用 make 而不是池化，避免数据竞态
-	resultBuf := make([]byte, 0, NonceSize+len(plaintext)+TagSize)
-	resultBuf = append(resultBuf, nonce...)
+	resultBuf := make([]byte, NonceSize, NonceSize+len(plaintext)+TagSize)
+
+	// Generate random nonce directly into the beginning of the result buffer
+	if _, err := io.ReadFull(rand.Reader, resultBuf); err != nil {
+		return nil, err
+	}
+	nonce := resultBuf
 
 	// 在结果缓冲区中加密（从第 NonceSize 个位置开始）
 	aead := m.aeadPool.Get().(cipher.AEAD)
 	ciphertext := aead.Seal(resultBuf, nonce, plaintext, nil)
 	m.aeadPool.Put(aead)
-
-	// 立即归还 nonce 缓冲区，不等待函数返回
-	noncePool.Put(noncePtr)
 
 	return ciphertext, nil
 }
@@ -126,26 +109,16 @@ func (m *Manager) EncryptTo(dst, plaintext []byte) ([]byte, error) {
 		return nil, errors.New("destination buffer too small")
 	}
 
-	// 从池中获取 nonce 缓冲区
-	noncePtr := noncePool.Get().(*[]byte)
-	nonce := *noncePtr
-
-	// Generate random nonce
+	// Generate random nonce directly into destination buffer
+	nonce := dst[:NonceSize]
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		noncePool.Put(noncePtr)
 		return nil, err
 	}
-
-	// 将 nonce 复制到目标缓冲区
-	copy(dst[:NonceSize], nonce)
 
 	// 在目标缓冲区中加密（从第 NonceSize 个位置开始）
 	aead := m.aeadPool.Get().(cipher.AEAD)
 	ciphertext := aead.Seal(dst[:NonceSize], nonce, plaintext, nil)
 	m.aeadPool.Put(aead)
-
-	// 立即归还 nonce 缓冲区
-	noncePool.Put(noncePtr)
 
 	return ciphertext, nil
 }

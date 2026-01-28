@@ -47,18 +47,18 @@ const cryptoOverhead = 32
 // udpHeaderSize UDP 帧头大小 (2字节长度)
 const udpHeaderSize = 2
 
-// encryptBufferPool 用于加密缓冲区复用（16KB + 34字节开销）
+// encryptBufferPool 用于加密缓冲区复用（最大 UDP 大小 + 开销）
 var encryptBufferPool = sync.Pool{
 	New: func() any {
-		buffer := make([]byte, DefaultBufferSize+cryptoOverhead)
+		buffer := make([]byte, UDPBufferSize)
 		return &buffer
 	},
 }
 
-// decryptBufferPool 用于解密缓冲区复用（16KB）
+// decryptBufferPool 用于解密缓冲区复用（最大 UDP 大小）
 var decryptBufferPool = sync.Pool{
 	New: func() any {
-		buffer := make([]byte, DefaultBufferSize)
+		buffer := make([]byte, UDPBufferSize)
 		return &buffer
 	},
 }
@@ -170,9 +170,9 @@ func CopyWithEncryption(
 	}
 
 	// 从池中获取加密缓冲区
-	encryptBufPtr := encryptBufferPool.Get().(*[]byte)
+	encryptBufPtr := GetBuffer(&encryptBufferPool)
 	encryptBuf := *encryptBufPtr
-	defer encryptBufferPool.Put(encryptBufPtr)
+	defer PutBuffer(&encryptBufferPool, encryptBufPtr)
 
 	// 确保缓冲区足够大
 	requiredSize := len(buf) + cryptoOverhead
@@ -263,9 +263,9 @@ func CopyWithDecryption(
 	}
 
 	// 从池中获取解密缓冲区 (用于存放解密后的 plaintext)
-	plaintextBufPtr := decryptBufferPool.Get().(*[]byte)
+	plaintextBufPtr := GetBuffer(&decryptBufferPool)
 	plaintextBuf := *plaintextBufPtr
-	defer decryptBufferPool.Put(plaintextBufPtr)
+	defer PutBuffer(&decryptBufferPool, plaintextBufPtr)
 
 	// Length header buffer
 	var lenBuf [2]byte
