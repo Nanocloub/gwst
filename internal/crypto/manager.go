@@ -3,9 +3,11 @@ package crypto
 import (
 	"crypto/cipher"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
 
 	"github.com/aegis-aead/go-libaegis/aegis128l"
 )
@@ -34,6 +36,7 @@ var (
 type Manager struct {
 	key      []byte
 	aeadPool sync.Pool
+	counter  atomic.Uint64 // 用于生成唯一 nonce（计数器部分）
 }
 
 // NewManager creates a new crypto manager with AEGIS-128L
@@ -58,18 +61,36 @@ func NewManager(key []byte) (*Manager, error) {
 	return m, nil
 }
 
+// generateNonce 生成安全的 nonce（计数器 + 随机数混合模式）
+// 前 8 字节：递增计数器（保证唯一性，支持 2^64 次加密）
+// 后 8 字节：随机数（防止预测和回放攻击）
+func (m *Manager) generateNonce() ([]byte, error) {
+	nonce := make([]byte, NonceSize)
+	
+	// 前 8 字节：原子递增计数器（绝对唯一）
+	count := m.counter.Add(1)
+	binary.BigEndian.PutUint64(nonce[:8], count)
+	
+	// 后 8 字节：随机数（增强安全性）
+	if _, err := io.ReadFull(rand.Reader, nonce[8:]); err != nil {
+		return nil, err
+	}
+	
+	return nonce, nil
+}
+
 // Encrypt encrypts plaintext using AEGIS-128L
 // Returns: nonce + ciphertext + tag
 func (m *Manager) Encrypt(plaintext []byte) ([]byte, error) {
-	// 创建结果缓冲区，包含 nonce + ciphertext + tag
-	// 使用 make 而不是池化，避免数据竞态
-	resultBuf := make([]byte, NonceSize, NonceSize+len(plaintext)+TagSize)
-
-	// Generate random nonce directly into the beginning of the result buffer
-	if _, err := io.ReadFull(rand.Reader, resultBuf); err != nil {
+	// 生成安全的 nonce
+	nonce, err := m.generateNonce()
+	if err != nil {
 		return nil, err
 	}
-	nonce := resultBuf
+	
+	// 创建结果缓冲区，包含 nonce + ciphertext + tag
+	resultBuf := make([]byte, NonceSize, NonceSize+len(plaintext)+TagSize)
+	copy(resultBuf, nonce)
 
 	// 在结果缓冲区中加密（从第 NonceSize 个位置开始）
 	aead := m.aeadPool.Get().(cipher.AEAD)
@@ -109,11 +130,14 @@ func (m *Manager) EncryptTo(dst, plaintext []byte) ([]byte, error) {
 		return nil, errors.New("destination buffer too small")
 	}
 
-	// Generate random nonce directly into destination buffer
-	nonce := dst[:NonceSize]
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+	// 生成安全的 nonce
+	nonce, err := m.generateNonce()
+	if err != nil {
 		return nil, err
 	}
+	
+	// 将 nonce 复制到目标缓冲区
+	copy(dst[:NonceSize], nonce)
 
 	// 在目标缓冲区中加密（从第 NonceSize 个位置开始）
 	aead := m.aeadPool.Get().(cipher.AEAD)
@@ -158,3 +182,4 @@ func GenerateKey() ([]byte, error) {
 	}
 	return key, nil
 }
+

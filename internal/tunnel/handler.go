@@ -329,9 +329,26 @@ var pingCodec = websocket.Codec{
 	},
 }
 
+// decryptUDPData 解密 UDP 数据的辅助方法
+// 性能关键：直接解密到目标 buffer，零额外分配和复制
+func (h *Handler) decryptUDPData(buffer *[]byte, encryptedData []byte) (int, error) {
+	if h.cryptoManager == nil {
+		// 无加密时直接复制
+		return copy(*buffer, encryptedData), nil
+	}
+	
+	// 直接解密到目标 buffer，避免中间缓冲区
+	decrypted, err := h.cryptoManager.DecryptTo(*buffer, encryptedData)
+	if err != nil {
+		return 0, err
+	}
+	
+	return len(decrypted), nil
+}
+
 func (h *Handler) handle(ws *websocket.Conn, network, addr string, fallbackAddrs []string) {
-	exit := make(chan struct{})
-	defer close(exit)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	var writeMu sync.Mutex
 
@@ -346,28 +363,52 @@ func (h *Handler) handle(ws *websocket.Conn, network, addr string, fallbackAddrs
 		for {
 			select {
 			case <-ticker.C:
-				writeMu.Lock()
-				// Set write deadline to prevent hanging on slow/blocked connections
-				ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
-				err := pingCodec.Send(ws, nil)
-				if err == nil {
-					// Update read deadline after successful send
-					ws.SetReadDeadline(time.Now().Add(90 * time.Second))
-					// Clear write deadline
-					ws.SetWriteDeadline(time.Time{})
+				// 尝试获取锁，使用非阻塞方式避免死锁和goroutine泄漏
+				lockCtx, lockCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				
+				locked := make(chan bool, 1)
+				
+				go func() {
+					writeMu.Lock()
+					select {
+					case locked <- true:
+						// 成功通知
+					case <-lockCtx.Done():
+						// 超时了，释放锁
+						writeMu.Unlock()
+					}
+				}()
+
+				select {
+				case <-locked:
+					// 成功获取锁，发送 ping
+					ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
+					err := pingCodec.Send(ws, nil)
+					if err == nil {
+						ws.SetReadDeadline(time.Now().Add(90 * time.Second))
+						ws.SetWriteDeadline(time.Time{})
+						writeMu.Unlock()
+						lockCancel()
+						continue
+					}
 					writeMu.Unlock()
+					lockCancel()
+
+					h.log.Errorf("Failed to send ping: %v", err)
+					_ = ws.Close()
+					return
+
+				case <-lockCtx.Done():
+					// 超时，跳过本次 ping（goroutine 会自动释放锁）
+					lockCancel()
+					h.log.Warn("Failed to acquire write lock for ping within 5s, skipping this ping cycle")
 					continue
 				}
-				writeMu.Unlock()
-
-				h.log.Errorf("Failed to send ping: %v", err)
-				_ = ws.Close()
-				return
 			case <-h.closeChan:
 				h.log.Infof("Closing connection due to shutdown")
 				_ = ws.Close()
 				return
-			case <-exit:
+			case <-ctx.Done():
 				return
 			}
 		}
@@ -403,18 +444,11 @@ func (h *Handler) handleUDP(ws *websocket.Conn, addr string, fallbackAddrs []str
 			return
 		}
 
-		// Decrypt early data if encryption is enabled
-		if h.cryptoManager != nil {
-			dstBuf := utils.GetBuffer(h.bufferPool)
-			decrypted, err := h.cryptoManager.DecryptTo(*dstBuf, (*buffer)[:n])
-			if err != nil {
-				utils.PutBuffer(h.bufferPool, dstBuf)
-				h.log.Errorf("Failed to decrypt X-0RTT header: %v", err)
-				return
-			}
-			// Copy decrypted data back to buffer
-			n = copy(*buffer, decrypted)
-			utils.PutBuffer(h.bufferPool, dstBuf)
+		// 解密 early data（如果启用加密）
+		n, err = h.decryptUDPData(buffer, (*buffer)[:n])
+		if err != nil {
+			h.log.Errorf("Failed to decrypt X-0RTT header: %v", err)
+			return
 		}
 	} else {
 		err = ws.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -429,23 +463,12 @@ func (h *Handler) handleUDP(ws *websocket.Conn, addr string, fallbackAddrs []str
 			h.log.Errorf("Failed to read from tunnel connection: %v", err)
 			return
 		}
-		n = len(message)
 
-		if h.cryptoManager != nil {
-			// Acquire a temporary buffer for decryption to avoid allocation
-			dstBuf := utils.GetBuffer(h.bufferPool)
-			decrypted, err := h.cryptoManager.DecryptTo(*dstBuf, message)
-			if err != nil {
-				utils.PutBuffer(h.bufferPool, dstBuf)
-				h.log.Errorf("Failed to decrypt X-0RTT/First packet (size=%d): %v", n, err)
-				return
-			}
-			// Copy decrypted data back to buffer for original processing logic
-			n = copy(*buffer, decrypted)
-			utils.PutBuffer(h.bufferPool, dstBuf)
-		} else {
-			// Without encryption, copy message to buffer
-			n = copy(*buffer, message)
+		// 解密首个消息（如果启用加密）
+		n, err = h.decryptUDPData(buffer, message)
+		if err != nil {
+			h.log.Errorf("Failed to decrypt first packet: %v", err)
+			return
 		}
 
 		err = ws.SetReadDeadline(time.Time{})
@@ -466,127 +489,49 @@ func (h *Handler) handleUDP(ws *websocket.Conn, addr string, fallbackAddrs []str
 		h.log.Errorf("Failed to connect to UDP target: %v", err)
 		return
 	}
-	defer conn.Close()
+	
+	// 使用 sync.Once 确保连接只关闭一次
+	var closeOnce sync.Once
+	closeConn := func() { closeOnce.Do(func() { conn.Close() }) }
+	defer closeConn() // 异常安全：确保 panic 时也能关闭连接
 
-	writeMu.Lock()
-	var writeErr error
-	if h.cryptoManager != nil {
-		dstBuf := utils.GetBuffer(h.bufferPool)
-		encrypted, err := h.cryptoManager.EncryptTo(*dstBuf, (*readBuffer)[:rn])
-		if err != nil {
-			utils.PutBuffer(h.bufferPool, dstBuf)
-			writeMu.Unlock()
-			utils.PutBuffer(h.bufferPool, readBuffer)
-			h.log.Errorf("Failed to encrypt response: %v", err)
-			return
-		}
-		_, writeErr = ws.Write(encrypted)
-		utils.PutBuffer(h.bufferPool, dstBuf)
-	} else {
-		_, writeErr = ws.Write((*readBuffer)[:rn])
-	}
+	// 使用 CryptoConn 处理 WebSocket 的消息边界、加密和解密
+	// LockedConn 确保写入线程安全（与 ping goroutine 共享 writeMu）
+	// CryptoConn.Read 有独立的 readMu 保护内部 readBuf，读写可以并发
+	tunnelConn := utils.NewCryptoConn(&utils.LockedConn{Conn: ws, Mu: writeMu}, h.cryptoManager, false)
 
-	if writeErr != nil {
-		writeMu.Unlock()
+	// Send response for the first UDP packet (already read during dial)
+	_, err = tunnelConn.Write((*readBuffer)[:rn])
+
+	if err != nil {
 		utils.PutBuffer(h.bufferPool, readBuffer)
-		h.log.Errorf("Failed to write to WebSocket: %v", writeErr)
+		h.log.Errorf("Failed to write response to WebSocket: %v", err)
 		return
 	}
-	writeMu.Unlock()
 
 	var wg sync.WaitGroup
+	
+	// 启动读取 goroutine：从 Tunnel 读取并写入 Target
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		defer conn.Close()
+		defer closeConn() // 使用 sync.Once 包装的关闭函数
 		defer utils.PutBuffer(h.bufferPool, readBuffer)
 
-		// UDP: Read from WS(Tunnel) -> Decrypt -> Write to Target
-		// Note: copyWithDecryption expects the source to be length-prefixed stream.
-		// BUT WebSocket messages are already framed.
-		// If h.cryptoManager is used, we need packet-based decryption if it's WebSocket.
-		// Wait, copyWithDecryption is designed for Stream (TCP).
-		// For UDP over WebSocket, we just loop Read/Write packets.
-
-		if h.cryptoManager != nil {
-			// Custom loop for Encrypted Message based UDP
-			var decryptDstBuf *[]byte
-			for {
-				var message []byte
-				err := websocket.Message.Receive(ws, &message)
-				if err != nil {
-					if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
-						h.log.Infof("Failed to read from Tunnel: %v", err)
-					}
-					return
-				}
-				n := len(message)
-
-				if n < 32 {
-					h.log.Warnf("Received truncated UDP packet (size=%d), dropping", n)
-					continue
-				}
-
-				if decryptDstBuf == nil {
-					decryptDstBuf = utils.GetBuffer(h.bufferPool)
-					defer utils.PutBuffer(h.bufferPool, decryptDstBuf)
-				}
-				decrypted, err := h.cryptoManager.DecryptTo(*decryptDstBuf, message)
-				if err != nil {
-					h.log.Warnf("Failed to decrypt UDP packet (n=%d): %v", n, err)
-					continue
-				}
-
-				if _, err := conn.Write(decrypted); err != nil {
-					h.log.Infof("Failed to write to Target: %v", err)
-					return
-				}
-			}
-		} else {
-			if _, err := utils.CopyBufferWithWriteTimeout(conn, ws, *readBuffer, utils.DefaultWriteTimeout); err != nil &&
-				!errors.Is(err, net.ErrClosed) {
-				h.log.Infof("Failed to copy data to Target: %v", err)
-			}
+		// UDP: Read from Tunnel -> Decrypt -> Write to Target
+		// 复用 tunnelConn 作为 reader，WebSocket 读取不需要锁保护
+		if _, err := utils.CopyBufferWithWriteTimeout(conn, tunnelConn, *readBuffer, utils.DefaultWriteTimeout); err != nil &&
+			!errors.Is(err, net.ErrClosed) {
+			h.log.Infof("Failed to copy data from Tunnel to Target: %v", err)
 		}
 	}()
 
-	lockedWs := &utils.LockedWriter{W: ws, Mu: writeMu}
-
-	if h.cryptoManager != nil {
-		// Custom loop for Target(UDP) -> Encrypt -> WS(Tunnel)
-		buf := *buffer
-		var encryptDstBuf *[]byte
-		for {
-			n, err := conn.Read(buf)
-			if err != nil {
-				if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
-					h.log.Infof("Failed to read from Target: %v", err)
-				}
-				return
-			}
-
-			if encryptDstBuf == nil {
-				encryptDstBuf = utils.GetBuffer(h.bufferPool)
-				defer utils.PutBuffer(h.bufferPool, encryptDstBuf)
-			}
-			// We must encrypt before protecting with lock?
-			// Ideally yes, but we need to write to lockedWs.
-			encrypted, err := h.cryptoManager.EncryptTo(*encryptDstBuf, buf[:n])
-			if err != nil {
-				h.log.Warnf("Failed to encrypt UDP packet: %v", err)
-				return
-			}
-
-			if _, err := lockedWs.Write(encrypted); err != nil {
-				h.log.Infof("Failed to write to Tunnel: %v", err)
-				return
-			}
-		}
-	} else {
-		if _, err := utils.CopyBufferWithWriteTimeout(lockedWs, conn, *buffer, utils.DefaultWriteTimeout); err != nil &&
-			!errors.Is(err, net.ErrClosed) {
-			h.log.Infof("Failed to copy data to WebSocket: %v", err)
-		}
+	// UDP: Read from Target -> Encrypt -> Write to Tunnel
+	writeBuffer := utils.GetBuffer(h.bufferPool)
+	defer utils.PutBuffer(h.bufferPool, writeBuffer)
+	if _, err := utils.CopyBufferWithWriteTimeout(tunnelConn.(utils.DeadlineWriter), conn, *writeBuffer, utils.DefaultWriteTimeout); err != nil &&
+		!errors.Is(err, net.ErrClosed) {
+		h.log.Infof("Failed to copy data from Target to Tunnel: %v", err)
 	}
 
 	// Wait for the copy goroutine to finish
@@ -599,19 +544,30 @@ func (h *Handler) handleNetwork(ws *websocket.Conn, network, addr string, fallba
 		h.log.Errorf("Failed to connect to target: %v", err)
 		return
 	}
-	defer conn.Close()
+	
+	// 使用 sync.Once 确保连接只关闭一次
+	var closeOnce sync.Once
+	closeConn := func() { closeOnce.Do(func() { conn.Close() }) }
+	defer closeConn() // 异常安全：确保 panic 时也能关闭连接
 
 	var wg sync.WaitGroup
+
+	// 创建单个 CryptoConn 实例用于双向传输
+	// - 写入：LockedConn 提供锁保护（与 ping goroutine 共享 writeMu）
+	// - 读取：CryptoConn 内部 readMu 保护 readBuf，与写入互不干扰
+	// - 并发安全：底层 WebSocket 读写可以在不同 goroutine 中安全进行
+	tunnelConn := utils.NewCryptoConn(&utils.LockedConn{Conn: ws, Mu: writeMu}, h.cryptoManager, false)
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		defer conn.Close()
+		defer closeConn() // 使用 sync.Once 包装的关闭函数
 		buffer := utils.GetBuffer(h.bufferPool)
 		defer utils.PutBuffer(h.bufferPool, buffer)
 
 		// Direction: Tunnel(ws) -> Target(conn)
-		// We read Encrypted stream from Tunnel, Decrypt, Write Plain to Target.
-		if _, err := h.copyWithDecryption(conn, ws, *buffer); err != nil &&
+		// WebSocket 模式下，每次 Read 都会获取完整消息，不会有帧交错问题
+		if _, err := utils.CopyBufferWithWriteTimeout(conn, tunnelConn, *buffer, utils.DefaultWriteTimeout); err != nil &&
 			!errors.Is(err, net.ErrClosed) {
 			h.log.Infof("Failed to copy data to Target: %v", err)
 		}
@@ -620,13 +576,10 @@ func (h *Handler) handleNetwork(ws *websocket.Conn, network, addr string, fallba
 	buffer := utils.GetBuffer(h.bufferPool)
 	defer utils.PutBuffer(h.bufferPool, buffer)
 
-	lockedWs := &utils.LockedWriter{W: ws, Mu: writeMu}
-
 	// Direction: Target(conn) -> Tunnel(ws)
-	// We read Plain from Target, Encrypt, Write Encrypted stream to Tunnel.
-	if _, err := h.copyWithEncryption(lockedWs, conn, *buffer); err != nil &&
+	if _, err := utils.CopyBufferWithWriteTimeout(tunnelConn.(utils.DeadlineWriter), conn, *buffer, utils.DefaultWriteTimeout); err != nil &&
 		!errors.Is(err, net.ErrClosed) {
-		h.log.Infof("Failed to copy data to WebSocket: %v", err)
+		h.log.Infof("Failed to copy data to Tunnel: %v", err)
 	}
 
 	// Wait for the copy goroutine to finish
@@ -686,6 +639,11 @@ func (h *Handler) dialUDP(
 			return buffer, rn, conn, nil
 		}
 
+		// 回收失败时分配的 buffer，防止内存泄漏
+		if buffer != nil {
+			utils.PutBuffer(h.bufferPool, buffer)
+		}
+
 		errs = append(errs, batchErr)
 	}
 
@@ -724,6 +682,12 @@ func (h *Handler) dialAndCheckUDP(
 
 	rn, err := conn.Read(*buffer)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, new(net.Error)) && err.(net.Error).Timeout()) {
+			// Ignore read timeout on the first packet, as some UDP services may not respond immediately.
+			// This allows the tunnel to be established even for silent backends.
+			h.log.Infof("UDP target %s is silent on dial, proceeding anyway", addr)
+			return buffer, 0, conn, nil
+		}
 		utils.PutBuffer(h.bufferPool, buffer)
 		conn.Close()
 		return nil, 0, nil, err
@@ -737,16 +701,6 @@ func (h *Handler) dialAndCheckUDP(
 	}
 
 	return buffer, rn, conn, nil
-}
-
-// copyWithEncryption copies data from src to dst, encrypting if crypto manager is available
-func (h *Handler) copyWithEncryption(dst deadlineWriter, src io.Reader, buf []byte) (written int64, err error) {
-	return utils.CopyWithEncryption(dst, src, buf, h.cryptoManager, utils.DefaultWriteTimeout)
-}
-
-// copyWithDecryption copies data from src to dst, decrypting if crypto manager is available
-func (h *Handler) copyWithDecryption(dst deadlineWriter, src io.Reader, buf []byte) (written int64, err error) {
-	return utils.CopyWithDecryption(dst, src, buf, h.cryptoManager, utils.DefaultWriteTimeout)
 }
 
 func (h *Handler) Close() {
@@ -792,25 +746,34 @@ func (h *Handler) HandleRawConnection(conn net.Conn, protocol, target string, fa
 		return h.handleRawUDP(conn, target, fallbackAddrs)
 	}
 
-	// 直接复制数据
+	// Directly duplicate data
 	targetConn, err := dial(context.Background(), protocol, target, fallbackAddrs)
 	if err != nil {
 		h.log.Errorf("Failed to connect to target: %v", err)
 		return err
 	}
-	defer targetConn.Close()
+	
+	// 使用 sync.Once 确保连接只关闭一次
+	var closeOnce sync.Once
+	closeConn := func() { closeOnce.Do(func() { targetConn.Close() }) }
+	defer closeConn() // 异常安全：确保 panic 时也能关闭连接
 
 	var wg sync.WaitGroup
+
+	// Stream 模式：创建单个 CryptoConn 实例处理双向加密通信
+	// - 帧协议：[Len(2)][EncryptedPayload] 确保边界清晰
+	// - 并发安全：CryptoConn 内部 readMu 保护读缓冲，读写可并发
+	tunnelConn := utils.NewCryptoConn(conn, h.cryptoManager, true)
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		defer targetConn.Close()
+		defer closeConn() // 使用 sync.Once 包装的关闭函数
 		buffer := utils.GetBuffer(h.bufferPool)
 		defer utils.PutBuffer(h.bufferPool, buffer)
 
 		// Direction: Tunnel(conn) -> Target(targetConn)
-		// Tunnel sends [Len][Encrypted]. We Read, Decrypt, Write Raw to Target.
-		if _, err := h.copyWithDecryption(targetConn, conn, *buffer); err != nil &&
+		if _, err := utils.CopyBufferWithWriteTimeout(targetConn, tunnelConn, *buffer, utils.DefaultWriteTimeout); err != nil &&
 			!errors.Is(err, net.ErrClosed) {
 			h.log.Infof("Failed to copy data to Target: %v", err)
 		}
@@ -820,8 +783,7 @@ func (h *Handler) HandleRawConnection(conn net.Conn, protocol, target string, fa
 	defer utils.PutBuffer(h.bufferPool, buffer)
 
 	// Direction: Target(targetConn) -> Tunnel(conn)
-	// Target sends Raw. We Read, Encrypt, Frame [Len][Encrypted], Write to Tunnel.
-	if _, err := h.copyWithEncryption(conn, targetConn, *buffer); err != nil &&
+	if _, err := utils.CopyBufferWithWriteTimeout(tunnelConn.(deadlineWriter), targetConn, *buffer, utils.DefaultWriteTimeout); err != nil &&
 		!errors.Is(err, net.ErrClosed) {
 		h.log.Infof("Failed to copy data to Tunnel: %v", err)
 	}
@@ -833,200 +795,48 @@ func (h *Handler) HandleRawConnection(conn net.Conn, protocol, target string, fa
 // handleRawUDP 处理原始连接上的 UDP 流量（用于 TCP/QUIC 传输）
 // UDP over stream: 使用简单的长度前缀帧格式
 func (h *Handler) handleRawUDP(conn net.Conn, addr string, fallbackAddrs []string) error {
-	// 连接到 UDP 目标
-	targetConn, err := net.Dial("udp", addr)
+	// 使用统一的 dial 函数处理 fallback，保持逻辑一致性
+	targetConn, err := dial(context.Background(), "udp", addr, fallbackAddrs)
 	if err != nil {
-		if len(fallbackAddrs) == 0 {
-			h.log.Errorf("Failed to connect to UDP target: %v", err)
-			return err
-		}
-
-		// 尝试回退地址
-		var errs []error
-		errs = append(errs, err)
-		for _, fallbackAddr := range fallbackAddrs {
-			targetConn, err = net.Dial("udp", fallbackAddr)
-			if err == nil {
-				h.log.Infof("Connected to fallback UDP target: %s", fallbackAddr)
-				break
-			}
-			errs = append(errs, err)
-		}
-
-		if targetConn == nil {
-			h.log.Errorf("Failed to connect to UDP target: %v", errors.Join(errs...))
-			return errors.Join(errs...)
-		}
+		h.log.Errorf("Failed to connect to UDP target: %v", err)
+		return err
 	}
-	defer targetConn.Close()
+	
+	// 使用 sync.Once 确保连接只关闭一次
+	var closeOnce sync.Once
+	closeConn := func() { closeOnce.Do(func() { targetConn.Close() }) }
+	defer closeConn() // 异常安全：确保 panic 时也能关闭连接
 
 	var wg sync.WaitGroup
-	wg.Add(2)
+
+	// Stream 模式的 UDP：使用 CryptoConn 统一处理加密和帧封装
+	// - 即使无加密（cryptoManager=nil），也需要帧协议保证 UDP 包边界
+	// - 并发安全：内部 readMu 保护，读写可在不同 goroutine 并发执行
+	tunnelConn := utils.NewCryptoConn(conn, h.cryptoManager, true)
 
 	// 从客户端读取，写入目标（客户端 -> 服务端 -> 目标）
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		defer targetConn.Close()
+		defer closeConn() // 使用 sync.Once 包装的关闭函数
 
 		buffer := utils.GetBuffer(h.bufferPool)
 		defer utils.PutBuffer(h.bufferPool, buffer)
 
-		// 预分配 lenBuf，避免在循环中重复分配
-		var lenBuf [2]byte
-
-		var decryptDstBuf *[]byte
-		for {
-			// 读取帧长度（2字节）
-			if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
-				if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
-					h.log.Infof("Failed to read UDP frame length from client: %v", err)
-				}
-				return
-			}
-
-			frameLen := int(lenBuf[0])<<8 | int(lenBuf[1])
-			if frameLen == 0 {
-				h.log.Warnf("Received zero-length UDP frame from client, ignoring")
-				continue
-			}
-			if frameLen > len(*buffer) {
-				h.log.Errorf("UDP frame too large: %d bytes (buffer: %d)", frameLen, len(*buffer))
-				return
-			}
-
-			// 读取帧数据
-			if _, err := io.ReadFull(conn, (*buffer)[:frameLen]); err != nil {
-				if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
-					h.log.Infof("Failed to read UDP frame data from client: %v", err)
-				}
-				return
-			}
-
-			dataToWrite := (*buffer)[:frameLen]
-			if h.cryptoManager != nil {
-				// Use a temporary buffer for decryption
-				if decryptDstBuf == nil {
-					decryptDstBuf = utils.GetBuffer(h.bufferPool)
-					defer utils.PutBuffer(h.bufferPool, decryptDstBuf)
-				}
-
-				if frameLen < 32 {
-					h.log.Warnf("Received truncated UDP packet (size=%d), dropping", frameLen)
-					continue
-				}
-
-				decrypted, err := h.cryptoManager.DecryptTo(*decryptDstBuf, dataToWrite)
-				if err != nil {
-					h.log.Warnf("Failed to decrypt UDP frame (n=%d): %v", frameLen, err)
-					continue
-				}
-				// Write decrypted data to target
-				_, err = targetConn.Write(decrypted)
-				if err != nil {
-					if !errors.Is(err, net.ErrClosed) {
-						h.log.Infof("Failed to write to UDP target: %v", err)
-					}
-					return
-				}
-			} else {
-				// 写入目标
-				if _, err := targetConn.Write(dataToWrite); err != nil {
-					if !errors.Is(err, net.ErrClosed) {
-						h.log.Infof("Failed to write to UDP target: %v", err)
-					}
-					return
-				}
-			}
+		if _, err := io.CopyBuffer(targetConn, tunnelConn, *buffer); err != nil &&
+			!errors.Is(err, net.ErrClosed) {
+			h.log.Infof("Failed to copy data from Tunnel to UDP Target: %v", err)
 		}
 	}()
 
 	// 从目标读取，写入客户端（目标 -> 服务端 -> 客户端）
-	go func() {
-		defer wg.Done()
-		defer conn.Close()
-		buffer := utils.GetBuffer(h.bufferPool)
-		defer utils.PutBuffer(h.bufferPool, buffer)
+	buffer := utils.GetBuffer(h.bufferPool)
+	defer utils.PutBuffer(h.bufferPool, buffer)
 
-		// 预分配帧缓冲区，最大 65535 + 2 字节
-		frameBuffer := make([]byte, 2+len(*buffer))
-
-		for {
-			// 读取 UDP 数据包
-			n, err := targetConn.Read(*buffer)
-			if err != nil {
-				if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
-					h.log.Infof("Failed to read from UDP target: %v", err)
-				}
-				return
-			}
-
-			if n == 0 {
-				continue
-			}
-
-			dataLen := n
-			var dataToSend []byte
-
-			if h.cryptoManager != nil {
-				// Calculate required size for encrypted data
-				// Overhead is usually fixed but let's rely on EncryptTo logic or just ensure buffer is big enough
-				// EncryptTo needs dst to be large enough.
-				// We can reuse frameBuffer for encryption destination if we are careful.
-				// frameBuffer structure: [Len(2)][EncryptedData...]
-
-				// Max overhead for AEGIS-128L is 32 bytes.
-				// We need to ensure frameBuffer is large enough.
-				maxEncLen := dataLen + 32 // 32 is cryptoOverhead constant in copy.go but not exported here. 32 is safe.
-				if len(frameBuffer) < 2+maxEncLen {
-					frameBuffer = make([]byte, 2+maxEncLen)
-				}
-
-				encrypted, err := h.cryptoManager.EncryptTo(frameBuffer[2:], (*buffer)[:n])
-				if err != nil {
-					h.log.Warnf("Failed to encrypt UDP frame: %v", err)
-					return
-				}
-				dataToSend = encrypted
-				dataLen = len(encrypted)
-
-				// fill length
-				frameBuffer[0] = byte(dataLen >> 8)
-				frameBuffer[1] = byte(dataLen & 0xff)
-
-				// write frame
-				if _, err := conn.Write(frameBuffer[:2+dataLen]); err != nil {
-					if !errors.Is(err, net.ErrClosed) {
-						h.log.Infof("Failed to write to client: %v", err)
-					}
-					return
-				}
-			} else {
-				dataToSend = (*buffer)[:n]
-
-				if dataLen > 65535 {
-					h.log.Errorf("Packet too large: %d", dataLen)
-					continue
-				}
-
-				// 封装成帧：长度 + 数据，使用单次 Write 减少系统调用
-				// Ensure frameBuffer is large enough
-				if len(frameBuffer) < 2+dataLen {
-					frameBuffer = make([]byte, 2+dataLen)
-				}
-
-				frameBuffer[0] = byte(dataLen >> 8)
-				frameBuffer[1] = byte(dataLen & 0xff)
-				copy(frameBuffer[2:], dataToSend)
-
-				if _, err := conn.Write(frameBuffer[:2+dataLen]); err != nil {
-					if !errors.Is(err, net.ErrClosed) {
-						h.log.Infof("Failed to write to client: %v", err)
-					}
-					return
-				}
-			}
-		}
-	}()
+	if _, err := io.CopyBuffer(tunnelConn, targetConn, *buffer); err != nil &&
+		!errors.Is(err, net.ErrClosed) {
+		h.log.Infof("Failed to copy data from UDP Target to Tunnel: %v", err)
+	}
 
 	wg.Wait()
 	return nil
@@ -1035,3 +845,4 @@ func (h *Handler) handleRawUDP(conn net.Conn, addr string, fallbackAddrs []strin
 func isStreamConn(conn net.Conn) bool {
 	return utils.IsStreamConn(conn)
 }
+

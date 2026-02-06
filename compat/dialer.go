@@ -262,7 +262,8 @@ func ConnectWithConfig(ctx context.Context, cfg ConnectConfig) (net.Conn, error)
 	ws, err := connect(ctx, dialCfg)
 	if err == nil {
 		ws.PayloadType = websocket.BinaryFrame
-		return ws, nil
+		// 统一使用 CryptoConn 处理加密、消息边界（WebSocket）
+		return utils.NewCryptoConn(ws, cfg.CryptoManager, false), nil
 	}
 
 	if len(cfg.FallbackAddrs) == 0 {
@@ -278,7 +279,8 @@ func ConnectWithConfig(ctx context.Context, cfg ConnectConfig) (net.Conn, error)
 		ws, cerr := connectConcurrent(ctx, dialCfg, batch)
 		if cerr == nil {
 			ws.PayloadType = websocket.BinaryFrame
-			return ws, nil
+			// 统一使用 CryptoConn 处理加密、消息边界（WebSocket）
+			return utils.NewCryptoConn(ws, cfg.CryptoManager, false), nil
 		}
 
 		errs = append(errs, cerr)
@@ -636,5 +638,6 @@ func connectWithTransport(ctx context.Context, cfg ConnectConfig) (net.Conn, err
 		return nil, fmt.Errorf("failed to write protocol byte: %w", err)
 	}
 
-	return conn, nil
+	// 统一使用 CryptoConn 处理加密、帧封装（Stream）
+	return utils.NewCryptoConn(conn, cfg.CryptoManager, true), nil
 }

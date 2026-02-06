@@ -1,10 +1,10 @@
 package utils
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -37,28 +37,6 @@ type CryptoManager interface {
 var sharedBufferPool = sync.Pool{
 	New: func() any {
 		buffer := make([]byte, DefaultBufferSize)
-		return &buffer
-	},
-}
-
-// cryptoOverhead AEGIS-128L 加密开销 (nonce + tag)
-const cryptoOverhead = 32
-
-// udpHeaderSize UDP 帧头大小 (2字节长度)
-const udpHeaderSize = 2
-
-// encryptBufferPool 用于加密缓冲区复用（最大 UDP 大小 + 开销）
-var encryptBufferPool = sync.Pool{
-	New: func() any {
-		buffer := make([]byte, UDPBufferSize)
-		return &buffer
-	},
-}
-
-// decryptBufferPool 用于解密缓冲区复用（最大 UDP 大小）
-var decryptBufferPool = sync.Pool{
-	New: func() any {
-		buffer := make([]byte, UDPBufferSize)
 		return &buffer
 	},
 }
@@ -153,196 +131,6 @@ func CopyBufferWithWriteTimeout(
 	return written, err
 }
 
-// CopyWithEncryption copies data from src to dst with optional encryption
-func CopyWithEncryption(
-	dst DeadlineWriter,
-	src io.Reader,
-	buf []byte,
-	cm CryptoManager,
-	timeout time.Duration,
-) (written int64, err error) {
-	if cm == nil {
-		return CopyBufferWithWriteTimeout(dst, src, buf, timeout)
-	}
-
-	if timeout == 0 {
-		timeout = DefaultWriteTimeout
-	}
-
-	// 从池中获取加密缓冲区
-	encryptBufPtr := GetBuffer(&encryptBufferPool)
-	encryptBuf := *encryptBufPtr
-	defer PutBuffer(&encryptBufferPool, encryptBufPtr)
-
-	// 确保缓冲区足够大
-	requiredSize := len(buf) + cryptoOverhead
-	if len(encryptBuf) < requiredSize {
-		// 如果池中的缓冲区太小，重新分配
-		encryptBuf = make([]byte, requiredSize)
-		*encryptBufPtr = encryptBuf
-	}
-
-	for {
-		// Limit read size to ensure the resulting encrypted packet fits within a standard buffer
-		// (assuming the receiver uses a buffer of the same size as buf)
-		readBuf := buf
-		if len(buf) > cryptoOverhead {
-			readBuf = buf[:len(buf)-cryptoOverhead]
-		}
-
-		nr, er := src.Read(readBuf)
-		if nr > 0 {
-			// 1. 在开头预留2字节长度
-			// 2. 加密数据到 offset 2
-			payloadBuf := encryptBuf[2:]
-			encrypted, encErr := cm.EncryptTo(payloadBuf, buf[:nr])
-			if encErr != nil {
-				err = encErr
-				break
-			}
-
-			// 写入长度头
-			totalLen := len(encrypted)
-			binary.BigEndian.PutUint16(encryptBuf[:2], uint16(totalLen))
-
-			// 发送 [Len][EncryptedBody]
-			packet := encryptBuf[:2+totalLen]
-
-			err = dst.SetWriteDeadline(time.Now().Add(timeout))
-			if err != nil {
-				break
-			}
-
-			nw, ew := dst.Write(packet)
-			if nw < 0 || len(packet) < nw {
-				nw = 0
-
-				if ew == nil {
-					ew = errors.New("invalid write result")
-				}
-			}
-
-			written += int64(nr)
-
-			if ew != nil {
-				err = ew
-				break
-			}
-
-			if len(packet) != nw {
-				err = io.ErrShortWrite
-				break
-			}
-		}
-
-		if er != nil {
-			if er != io.EOF {
-				err = er
-			}
-			break
-		}
-	}
-
-	return written, err
-}
-
-// CopyWithDecryption copies data from src to dst with optional decryption
-func CopyWithDecryption(
-	dst DeadlineWriter,
-	src io.Reader,
-	buf []byte, // reusable buffer for reading ciphertext
-	cm CryptoManager,
-	timeout time.Duration,
-) (written int64, err error) {
-	if cm == nil {
-		return CopyBufferWithWriteTimeout(dst, src, buf, timeout)
-	}
-
-	if timeout == 0 {
-		timeout = DefaultWriteTimeout
-	}
-
-	// 从池中获取解密缓冲区 (用于存放解密后的 plaintext)
-	plaintextBufPtr := GetBuffer(&decryptBufferPool)
-	plaintextBuf := *plaintextBufPtr
-	defer PutBuffer(&decryptBufferPool, plaintextBufPtr)
-
-	// Length header buffer
-	var lenBuf [2]byte
-
-	for {
-		// 1. Read Length Header
-		if _, er := io.ReadFull(src, lenBuf[:]); er != nil {
-			if er != io.EOF {
-				err = er
-			}
-			break
-		}
-		length := int(binary.BigEndian.Uint16(lenBuf[:]))
-
-		// Ensure read buffer is large enough for ciphertext
-		if len(buf) < length {
-			// Grow buffer if needed (shouldn't happen often if buf is large enough)
-			// Note: buf is usually DefaultBufferSize (16KB)
-			// If a packet > 16KB comes:
-			newBuf := make([]byte, length)
-			buf = newBuf
-			// We don't update caller's pointer but we use it locally
-		}
-
-		// 2. Read Ciphertext Body
-		if _, er := io.ReadFull(src, buf[:length]); er != nil {
-			if er == io.EOF {
-				err = io.ErrUnexpectedEOF
-			} else {
-				err = er
-			}
-			break
-		}
-
-		// Ensure plaintext buffer is large enough
-		if len(plaintextBuf) < length {
-			plaintextBuf = make([]byte, length)
-			*plaintextBufPtr = plaintextBuf
-		}
-
-		// 3. Decrypt
-		decrypted, decErr := cm.DecryptTo(plaintextBuf, buf[:length])
-		if decErr != nil {
-			err = decErr
-			break
-		}
-
-		// 4. Write Plaintext
-		err = dst.SetWriteDeadline(time.Now().Add(timeout))
-		if err != nil {
-			break
-		}
-
-		nw, ew := dst.Write(decrypted)
-		if nw < 0 || len(decrypted) < nw {
-			nw = 0
-			if ew == nil {
-				ew = errors.New("invalid write result")
-			}
-		}
-
-		written += int64(nw)
-
-		if ew != nil {
-			err = ew
-			break
-		}
-
-		if len(decrypted) != nw {
-			err = io.ErrShortWrite
-			break
-		}
-	}
-
-	return written, err
-}
-
 // IsStreamConn 检查连接是否是流式连接（TCP/QUIC），而不是 WebSocket
 func IsStreamConn(conn any) bool {
 	if conn == nil {
@@ -370,4 +158,22 @@ func (w *LockedWriter) SetWriteDeadline(t time.Time) error {
 	err := w.W.SetWriteDeadline(t)
 	w.Mu.Unlock()
 	return err
+}
+
+// LockedConn wraps a net.Conn with a mutex for thread-safe Write operations.
+type LockedConn struct {
+	net.Conn
+	Mu *sync.Mutex
+}
+
+func (c *LockedConn) Write(p []byte) (int, error) {
+	c.Mu.Lock()
+	defer c.Mu.Unlock()
+	return c.Conn.Write(p)
+}
+
+func (c *LockedConn) SetWriteDeadline(t time.Time) error {
+	c.Mu.Lock()
+	defer c.Mu.Unlock()
+	return c.Conn.SetWriteDeadline(t)
 }
