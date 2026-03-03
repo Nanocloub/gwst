@@ -13,7 +13,7 @@ import (
 type CryptoConn struct {
 	net.Conn
 	cm       CryptoManager
-	isStream bool   // TCP/QUIC 为 true，WebSocket 为 false
+	isStream bool       // TCP/QUIC 为 true，WebSocket 为 false
 	readMu   sync.Mutex // 只保护 readBuf 的访问
 	readBuf  []byte     // 缓存流模式下解密多出的数据
 }
@@ -24,6 +24,23 @@ var _ DeadlineWriter = (*CryptoConn)(nil)
 
 func NewCryptoConn(conn net.Conn, cm CryptoManager, isStream bool) net.Conn {
 	return &CryptoConn{Conn: conn, cm: cm, isStream: isStream}
+}
+
+// wsConnFromConn unwraps conn wrappers (e.g. LockedConn) to find a *websocket.Conn.
+// LockedConn is only needed for Write (mutex with ping goroutine); reads can use
+// the underlying *websocket.Conn directly because websocket.Message.Receive is
+// self-framing and does not need the write mutex.
+func wsConnFromConn(c net.Conn) (*websocket.Conn, bool) {
+	for {
+		if ws, ok := c.(*websocket.Conn); ok {
+			return ws, true
+		}
+		if lc, ok := c.(*LockedConn); ok {
+			c = lc.Conn
+			continue
+		}
+		return nil, false
+	}
 }
 
 // cryptoBufferPool is used for temporary encryption/decryption buffers to reduce GC pressure
@@ -61,7 +78,7 @@ func (c *CryptoConn) Read(b []byte) (int, error) {
 
 		if !c.isStream {
 			// WebSocket mode: Each message is a complete packet
-			if ws, ok := c.Conn.(*websocket.Conn); ok {
+			if ws, ok := wsConnFromConn(c.Conn); ok {
 				var message []byte
 				err = websocket.Message.Receive(ws, &message)
 				if err != nil {
@@ -87,7 +104,7 @@ func (c *CryptoConn) Read(b []byte) (int, error) {
 				if c.cm != nil {
 					// 使用 buffer 的后半部分作为解密目标，避免数据重叠
 					dstOffset := len(tmpBuf) / 2
-				db, err = c.cm.DecryptTo(tmpBuf[dstOffset:], tmpBuf[:n])
+					db, err = c.cm.DecryptTo(tmpBuf[dstOffset:], tmpBuf[:n])
 					if err != nil {
 						cryptoBufferPool.Put(bufPtr)
 						return 0, err
