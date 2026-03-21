@@ -151,6 +151,12 @@ type TransportClientConfig struct {
 
 	// 上下文
 	Context context.Context
+
+	// 自定义 Dialer（可选，用于 Android VPN socket 保护等场景）
+	Dialer *net.Dialer
+
+	// 自定义 ListenConfig（可选，用于 QUIC/UDP Android VPN socket 保护）
+	ListenConfig *net.ListenConfig
 }
 
 // IsValidTransport 检查传输类型是否有效，委托给 config 实现

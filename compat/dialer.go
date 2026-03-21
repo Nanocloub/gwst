@@ -52,6 +52,7 @@ func (c *ConnectAddrConfig) Clone() *ConnectAddrConfig {
 
 type ConnectDialConfig struct {
 	Dialer        *net.Dialer
+	ListenConfig  *net.ListenConfig
 	Headers       http.Header
 	Host          string
 	Path          string
@@ -215,6 +216,13 @@ func WithEncryptionKey(key string) ConnectOption {
 func WithKey(key string) ConnectOption {
 	return func(c *ConnectConfig) {
 		c.Key = key
+	}
+}
+
+// WithListenConfig sets a custom net.ListenConfig (used for QUIC/UDP Android VPN socket protection)
+func WithListenConfig(lc *net.ListenConfig) ConnectOption {
+	return func(c *ConnectConfig) {
+		c.ListenConfig = lc
 	}
 }
 
@@ -603,13 +611,15 @@ func connectWithTransport(ctx context.Context, cfg ConnectConfig) (net.Conn, err
 
 	// 创建传输配置
 	transportCfg := transport.TransportClientConfig{
-		Type:       transportType,
-		RemoteAddr: cfg.Addr,
-		ServerName: cfg.ServerName,
-		Insecure:   cfg.Insecure,
-		TLS:        cfg.TLS,
-		Context:    ctx,
-		Logger:     transport.NewSafeLoggerOrNull(nil),
+		Type:         transportType,
+		RemoteAddr:   cfg.Addr,
+		ServerName:   cfg.ServerName,
+		Insecure:     cfg.Insecure,
+		TLS:          cfg.TLS,
+		Context:      ctx,
+		Logger:       transport.NewSafeLoggerOrNull(nil),
+		Dialer:       cfg.Dialer,
+		ListenConfig: cfg.ListenConfig,
 	}
 
 	// 创建传输管理器

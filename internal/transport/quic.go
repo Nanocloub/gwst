@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -212,13 +213,37 @@ func (qct *QUICClientTransport) Dial(ctx context.Context) (net.Conn, error) {
 		MinVersion:         tls.VersionTLS13,
 	}
 
-	// Dial QUIC connection
-	conn, err := quic.DialAddr(ctx, qct.config.RemoteAddr, tlsConfig, &quic.Config{
+	quicConf := &quic.Config{
 		MaxIdleTimeout:  time.Minute * 5,
 		KeepAlivePeriod: time.Second * 30,
-	})
-	if err != nil {
-		return nil, err
+	}
+
+	var conn quic.Connection
+	var err error
+
+	// 使用自定义 ListenConfig 创建受保护的 UDP socket（Android VPN 场景）
+	if qct.config.ListenConfig != nil {
+		var pconn net.PacketConn
+		pconn, err = qct.config.ListenConfig.ListenPacket(ctx, "udp", "")
+		if err != nil {
+			return nil, fmt.Errorf("failed to create UDP socket: %w", err)
+		}
+		tr := &quic.Transport{Conn: pconn}
+		addr, resolveErr := net.ResolveUDPAddr("udp", qct.config.RemoteAddr)
+		if resolveErr != nil {
+			pconn.Close()
+			return nil, fmt.Errorf("failed to resolve remote addr: %w", resolveErr)
+		}
+		conn, err = tr.Dial(ctx, addr, tlsConfig, quicConf)
+		if err != nil {
+			pconn.Close()
+			return nil, err
+		}
+	} else {
+		conn, err = quic.DialAddr(ctx, qct.config.RemoteAddr, tlsConfig, quicConf)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Open a new stream

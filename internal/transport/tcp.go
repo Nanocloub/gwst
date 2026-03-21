@@ -205,8 +205,11 @@ func (tct *TCPClientTransport) Dial(ctx context.Context) (net.Conn, error) {
 		return nil, net.ErrClosed
 	}
 
-	dialer := &net.Dialer{
-		Timeout: time.Second * 5,
+	dialer := tct.config.Dialer
+	if dialer == nil {
+		dialer = &net.Dialer{
+			Timeout: time.Second * 5,
+		}
 	}
 
 	if ctx == nil {
