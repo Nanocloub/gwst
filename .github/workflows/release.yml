@@ -17,10 +17,25 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        targets:
-          - windows/amd64
-          - linux/amd64
-          - linux/arm64
+        include:
+          - target: linux/amd64
+            goos: linux
+            goarch: amd64
+            cc: gcc
+            output: gwst-linux-amd64
+            apt_packages: ""
+          # - target: linux/arm64
+          #   goos: linux
+          #   goarch: arm64
+          #   cc: aarch64-linux-gnu-gcc
+          #   output: gwst-linux-arm64
+          #   apt_packages: gcc-aarch64-linux-gnu
+          # - target: windows/amd64
+          #   goos: windows
+          #   goarch: amd64
+          #   cc: x86_64-w64-mingw32-gcc
+          #   output: gwst-windows-amd64.exe
+          #   apt_packages: gcc-mingw-w64-x86-64
 
     steps:
       - uses: actions/checkout@v4
@@ -31,19 +46,24 @@ jobs:
           go-version-file: "go.mod"
           check-latest: false
 
-      - name: Go Build
-        uses: zijiren233/go-build-action@v1
+      - name: Install cross-compiler
+        if: ${{ matrix.apt_packages != '' }}
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt_packages }}
+
+      - name: Build
         env:
-          MICRO_ARM64_DISABLED: true
-        with:
-          targets: ${{ matrix.targets }}
-          enable-micro: true
-          result-dir: ./dist
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "1"
+          CC: ${{ matrix.cc }}
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w" -o dist/${{ matrix.output }} .
 
       - name: Get Artifact Name
         id: artifact_name
         run: |
-          echo "artifact_name=$(echo ${{ matrix.targets }} | tr '/' '-')" >> $GITHUB_OUTPUT
+          echo "artifact_name=$(echo ${{ matrix.target }} | tr '/' '-')" >> $GITHUB_OUTPUT
 
       - name: Upload Binaries
         uses: actions/upload-artifact@v4

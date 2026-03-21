@@ -1,8 +1,10 @@
 FROM golang:1.25-alpine AS builder
 
+RUN apk add --no-cache gcc musl-dev
+
 COPY ./ ./
 
-ENV CGO_ENABLED=0
+ENV CGO_ENABLED=1
 
 ENV GOEXPERIMENT=greenteagc
 
