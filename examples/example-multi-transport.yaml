@@ -1,16 +1,27 @@
-# 多传输层配置示例
-# 支持: websocket, tcp, quic
+# gwst 完整配置示例
+# 涵盖所有传输层类型（websocket / tcp / quic）及认证加密配置
+#
+# 传输层（transport）:
+#   websocket  WebSocket over HTTP/HTTPS，默认值，穿透性最强
+#   tcp        直接 TCP 流，延迟更低
+#   quic       QUIC over UDP，必须启用 TLS
 
-# WebSocket 服务端（默认）
+
+# ─────────────────────────────────────────────
+# WebSocket 传输（默认）
+# ─────────────────────────────────────────────
+
+# WebSocket 服务端
 - is_client: false
   listen_addr: ":8000"
   target_addr: "localhost:80"
   path: "/ws"
-  transport: "websocket"  # 可省略，默认为 websocket
-  key: "1234567890123456"
+  transport: "websocket"             # 可省略，默认为 websocket
+  key: "my-auth-secret"              # X-Key 认证头，用于访问控制
+  encryption_key: "1234567890123456" # 独立数据加密密钥（推荐，16 字节，AEGIS-128L）
   tls: true
-  cert_file: ""
-  key_file: ""
+  cert_file: "cert.pem"
+  key_file: "key.pem"
   server_name: "example.com"
 
 # WebSocket 客户端
@@ -20,17 +31,23 @@
   host: "example.com"
   path: "/ws"
   transport: "websocket"
-  key: "1234567890123456"
+  key: "my-auth-secret"              # 必须与服务端相同
+  encryption_key: "1234567890123456" # 必须与服务端相同
   tls: true
   server_name: "example.com"
   insecure: true
+
+
+# ─────────────────────────────────────────────
+# TCP 传输（无 TLS，适合内网/已有外层加密的场景）
+# ─────────────────────────────────────────────
 
 # TCP 服务端
 - is_client: false
   listen_addr: ":8001"
   target_addr: "localhost:80"
   transport: "tcp"
-  key: "1234567890123456"
+  encryption_key: "1234567890123456"
   tls: false
 
 # TCP 客户端
@@ -38,15 +55,21 @@
   listen_addr: ":9001"
   target_addr: "127.0.0.1:8001"
   transport: "tcp"
-  key: "1234567890123456"
+  encryption_key: "1234567890123456"
   tls: false
+
+
+# ─────────────────────────────────────────────
+# TCP + TLS 传输
+# ─────────────────────────────────────────────
 
 # TCP+TLS 服务端
 - is_client: false
   listen_addr: ":8002"
   target_addr: "localhost:80"
   transport: "tcp"
-  key: "1234567890123456"
+  key: "my-auth-secret"
+  encryption_key: "1234567890123456"
   tls: true
   cert_file: "cert.pem"
   key_file: "key.pem"
@@ -57,28 +80,68 @@
   listen_addr: ":9002"
   target_addr: "127.0.0.1:8002"
   transport: "tcp"
-  key: "1234567890123456"
+  key: "my-auth-secret"
+  encryption_key: "1234567890123456"
   tls: true
   server_name: "example.com"
   insecure: true
 
-# QUIC 服务端（需要集成 quic-go）
+
+# ─────────────────────────────────────────────
+# QUIC 传输（必须启用 TLS）
+# ─────────────────────────────────────────────
+
+# QUIC 服务端
 - is_client: false
   listen_addr: ":8003"
   target_addr: "localhost:80"
   transport: "quic"
-  key: "1234567890123456"
+  key: "my-auth-secret"
+  encryption_key: "1234567890123456"
   tls: true
   cert_file: "cert.pem"
   key_file: "key.pem"
   server_name: "example.com"
+  # QUIC 接收窗口大小（可选，0 或不填 = quic-go 默认值）
+  # 适用于高带宽×高延迟（BDP 大）或并发流很多的场景，普通用途无需修改
+  # 默认值: stream 512 KB initial / 6 MB max，conn 512 KB initial / 15 MB max
+  # quic_initial_stream_receive_window: 26843545  # 25.6 MB
+  # quic_max_stream_receive_window:     26843545  # 25.6 MB
+  # quic_initial_conn_receive_window:   33554432  # 32 MB
+  # quic_max_conn_receive_window:       33554432  # 32 MB
 
-# QUIC 客户端（需要集成 quic-go）
+# QUIC 客户端
 - is_client: true
   listen_addr: ":9003"
   target_addr: "127.0.0.1:8003"
   transport: "quic"
-  key: "1234567890123456"
+  key: "my-auth-secret"
+  encryption_key: "1234567890123456"
   tls: true
   server_name: "example.com"
   insecure: true
+  # 客户端窗口与服务端各自独立配置，两端无需相同
+  # quic_initial_stream_receive_window: 26843545
+  # quic_max_stream_receive_window:     26843545
+  # quic_initial_conn_receive_window:   33554432
+  # quic_max_conn_receive_window:       33554432
+
+
+# ─────────────────────────────────────────────
+# 配置说明
+# ─────────────────────────────────────────────
+#
+# key（认证）:
+#   通过 X-Key HTTP 头传输，用于服务端访问控制；任意长度
+#   若未设置 encryption_key 且 key >= 16 字节，会用 key 前 16 字节加密（不推荐）
+#
+# encryption_key（加密，推荐）:
+#   独立的数据加密密钥，使用 AEGIS-128L 算法
+#   至少 16 字节，客户端与服务端必须完全相同
+#   优先级高于 key，两者可独立设置
+#
+# quic_*_receive_window（QUIC 窗口，可选）:
+#   仅对 transport: quic 有效，其他传输类型忽略
+#   客户端和服务端独立生效，两端无需相同，第三方客户端不设置时不影响连通性
+#   0 或不填 = quic-go 内置默认值，原有行为完全不变
+#   调大窗口可提升高延迟链路吞吐，代价是每条连接占用更多内存

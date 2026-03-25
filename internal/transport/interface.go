@@ -115,6 +115,12 @@ type TransportServerConfig struct {
 
 	// Logger 实例
 	Logger Logger
+
+	// QUIC 接收窗口大小（字节），0 表示使用 quic-go 默认值
+	QUICInitialStreamReceiveWindow uint64
+	QUICMaxStreamReceiveWindow     uint64
+	QUICInitialConnReceiveWindow   uint64
+	QUICMaxConnReceiveWindow       uint64
 }
 
 // TransportClientConfig 客户端传输配置
@@ -157,6 +163,12 @@ type TransportClientConfig struct {
 
 	// 自定义 ListenConfig（可选，用于 QUIC/UDP Android VPN socket 保护）
 	ListenConfig *net.ListenConfig
+
+	// QUIC 接收窗口大小（字节），0 表示使用 quic-go 默认值
+	QUICInitialStreamReceiveWindow uint64
+	QUICMaxStreamReceiveWindow     uint64
+	QUICInitialConnReceiveWindow   uint64
+	QUICMaxConnReceiveWindow       uint64
 }
 
 // IsValidTransport 检查传输类型是否有效，委托给 config 实现

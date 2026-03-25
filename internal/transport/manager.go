@@ -136,8 +136,12 @@ type quicClientFactory struct {
 }
 
 func (f *quicClientFactory) CreateClientTransport(cfg TransportClientConfig) (ClientTransport, error) {
-	// 缓存键：区分不同的远端地址和 TLS 参数
-	key := cfg.RemoteAddr + "|" + cfg.ServerName + "|" + fmt.Sprintf("%v", cfg.Insecure)
+	// 缓存键：区分不同的远端地址、TLS 参数和 QUIC 窗口配置
+	key := fmt.Sprintf("%s|%s|%v|%d|%d|%d|%d",
+		cfg.RemoteAddr, cfg.ServerName, cfg.Insecure,
+		cfg.QUICInitialStreamReceiveWindow, cfg.QUICMaxStreamReceiveWindow,
+		cfg.QUICInitialConnReceiveWindow, cfg.QUICMaxConnReceiveWindow,
+	)
 
 	f.mu.Lock()
 	if f.cache == nil {

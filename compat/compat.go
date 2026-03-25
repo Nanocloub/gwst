@@ -85,6 +85,11 @@ type Server struct {
 	waitListenCloseOnce   sync.Once
 	tls                   bool
 	transport             string // "websocket", "tcp", or "quic"
+	// QUIC 接收窗口大小（字节），0 表示使用 quic-go 默认值
+	quicInitialStreamRecvWindow uint64
+	quicMaxStreamRecvWindow     uint64
+	quicInitialConnRecvWindow   uint64
+	quicMaxConnRecvWindow       uint64
 }
 
 type ServerOption func(*Server)
@@ -133,6 +138,18 @@ func WithSelfSignedCert(opts ...SelfSignedCertOption) ServerOption {
 func WithTransport(transport string) ServerOption {
 	return func(ps *Server) {
 		ps.transport = transport
+	}
+}
+
+// WithQUICWindowSizes 设置 QUIC 接收窗口大小。
+// initialStream/maxStream 控制每条流的接收窗口，initialConn/maxConn 控制整个连接的接收窗口。
+// 0 表示保持 quic-go 默认值（stream: 512KB/6MB，conn: 512KB/15MB）。
+func WithQUICWindowSizes(initialStream, maxStream, initialConn, maxConn uint64) ServerOption {
+	return func(ps *Server) {
+		ps.quicInitialStreamRecvWindow = initialStream
+		ps.quicMaxStreamRecvWindow = maxStream
+		ps.quicInitialConnRecvWindow = initialConn
+		ps.quicMaxConnRecvWindow = maxConn
 	}
 }
 
@@ -312,13 +329,17 @@ func (ps *Server) serveWithTransport() error {
 
 	// 创建传输配置
 	cfg := transport.TransportServerConfig{
-		Type:       transportType,
-		ListenAddr: ps.listenAddr,
-		Handler:    ps.createTransportHandler(),
-		TLS:        ps.tls,
-		CertFile:   ps.certFile,
-		KeyFile:    ps.keyFile,
-		Logger:     transport.NewSafeLoggerOrNull(nil),
+		Type:                           transportType,
+		ListenAddr:                     ps.listenAddr,
+		Handler:                        ps.createTransportHandler(),
+		TLS:                            ps.tls,
+		CertFile:                       ps.certFile,
+		KeyFile:                        ps.keyFile,
+		Logger:                         transport.NewSafeLoggerOrNull(nil),
+		QUICInitialStreamReceiveWindow: ps.quicInitialStreamRecvWindow,
+		QUICMaxStreamReceiveWindow:     ps.quicMaxStreamRecvWindow,
+		QUICInitialConnReceiveWindow:   ps.quicInitialConnRecvWindow,
+		QUICMaxConnReceiveWindow:       ps.quicMaxConnRecvWindow,
 	}
 
 	// 创建传输管理器

@@ -86,9 +86,13 @@ func (qst *QUICServerTransport) Serve() error {
 
 	// Create QUIC listener
 	listener, err := quic.ListenAddr(qst.config.ListenAddr, tlsConfig, &quic.Config{
-		MaxIdleTimeout:    2 * time.Minute,
-		KeepAlivePeriod:   30 * time.Second,
-		InitialPacketSize: 1452, // 直接使用 quic-go 允许的最大包大小，跳过 PMTU 热身
+		MaxIdleTimeout:                 2 * time.Minute,
+		KeepAlivePeriod:                30 * time.Second,
+		InitialPacketSize:              1452, // 直接使用 quic-go 允许的最大包大小，跳过 PMTU 热身
+		InitialStreamReceiveWindow:     qst.config.QUICInitialStreamReceiveWindow,
+		MaxStreamReceiveWindow:         qst.config.QUICMaxStreamReceiveWindow,
+		InitialConnectionReceiveWindow: qst.config.QUICInitialConnReceiveWindow,
+		MaxConnectionReceiveWindow:     qst.config.QUICMaxConnReceiveWindow,
 	})
 	if err != nil {
 		qst.listenErr = err
@@ -234,7 +238,11 @@ func NewQUICClientTransport(cfg TransportClientConfig) (*QUICClientTransport, er
 		// 直接使用 quic-go 允许的最大包大小（1452 字节），跳过从 1280 开始的
 		// PMTU 探测热身阶段。对于本地/局域网场景（loopback MTU=65535）可立即
 		// 使用最大包，减少同等数据量所需的 UDP 数据包数。
-		InitialPacketSize: 1452,
+		InitialPacketSize:              1452,
+		InitialStreamReceiveWindow:     cfg.QUICInitialStreamReceiveWindow,
+		MaxStreamReceiveWindow:         cfg.QUICMaxStreamReceiveWindow,
+		InitialConnectionReceiveWindow: cfg.QUICInitialConnReceiveWindow,
+		MaxConnectionReceiveWindow:     cfg.QUICMaxConnReceiveWindow,
 	}
 
 	return &QUICClientTransport{

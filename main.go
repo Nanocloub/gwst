@@ -208,6 +208,17 @@ func newServer(endpoint config.Endpoint) *compat.Server {
 			compat.WithServerName(endpoint.ServerName),
 		)
 	}
+	if endpoint.QUICInitialStreamReceiveWindow != 0 ||
+		endpoint.QUICMaxStreamReceiveWindow != 0 ||
+		endpoint.QUICInitialConnReceiveWindow != 0 ||
+		endpoint.QUICMaxConnReceiveWindow != 0 {
+		opts = append(opts, compat.WithQUICWindowSizes(
+			endpoint.QUICInitialStreamReceiveWindow,
+			endpoint.QUICMaxStreamReceiveWindow,
+			endpoint.QUICInitialConnReceiveWindow,
+			endpoint.QUICMaxConnReceiveWindow,
+		))
+	}
 
 	return compat.NewServer(endpoint.Path, handler, opts...)
 }
@@ -226,6 +237,17 @@ func newClient(endpoint config.Endpoint) *compat.Forwarder {
 		compat.WithInsecure(endpoint.Insecure),
 		compat.WithKey(endpoint.Key),
 		compat.WithTransportType(endpoint.GetTransportType()),
+	}
+	if endpoint.QUICInitialStreamReceiveWindow != 0 ||
+		endpoint.QUICMaxStreamReceiveWindow != 0 ||
+		endpoint.QUICInitialConnReceiveWindow != 0 ||
+		endpoint.QUICMaxConnReceiveWindow != 0 {
+		opts = append(opts, compat.WithDialQUICWindowSizes(
+			endpoint.QUICInitialStreamReceiveWindow,
+			endpoint.QUICMaxStreamReceiveWindow,
+			endpoint.QUICInitialConnReceiveWindow,
+			endpoint.QUICMaxConnReceiveWindow,
+		))
 	}
 
 	forwarderOpts := []compat.ForwarderOption{

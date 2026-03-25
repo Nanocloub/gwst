@@ -90,6 +90,15 @@ type Endpoint struct {
 	DisableTCP          bool `yaml:"disable_tcp"`
 	DisableUDP          bool `yaml:"disable_udp"`
 	DisableUDPEarlyData bool `yaml:"disable_udp_early_data"`
+
+	// QUIC 流接收窗口大小（字节），0 表示使用 quic-go 默认值（512KB）
+	QUICInitialStreamReceiveWindow uint64 `yaml:"quic_initial_stream_receive_window"`
+	// QUIC 流最大接收窗口大小（字节），0 表示使用 quic-go 默认值（6MB）
+	QUICMaxStreamReceiveWindow uint64 `yaml:"quic_max_stream_receive_window"`
+	// QUIC 连接接收窗口大小（字节），0 表示使用 quic-go 默认值（512KB）
+	QUICInitialConnReceiveWindow uint64 `yaml:"quic_initial_conn_receive_window"`
+	// QUIC 连接最大接收窗口大小（字节），0 表示使用 quic-go 默认值（15MB）
+	QUICMaxConnReceiveWindow uint64 `yaml:"quic_max_conn_receive_window"`
 }
 
 // Endpoints 表示配置文件中的所有端点

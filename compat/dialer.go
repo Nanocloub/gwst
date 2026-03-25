@@ -67,6 +67,11 @@ type ConnectDialConfig struct {
 	TransportType string // \"websocket\", \"tcp\", or \"quic\"
 	// 可选的加密管理器（当配置了 encryption_key 时自动创建）
 	CryptoManager utils.CryptoManager
+	// QUIC 接收窗口大小（字节），0 表示使用 quic-go 默认值
+	QUICInitialStreamReceiveWindow uint64
+	QUICMaxStreamReceiveWindow     uint64
+	QUICInitialConnReceiveWindow   uint64
+	QUICMaxConnReceiveWindow       uint64
 }
 
 type splitedConnectDialConfig struct {
@@ -229,6 +234,18 @@ func WithListenConfig(lc *net.ListenConfig) ConnectOption {
 func WithTransportType(transportType string) ConnectOption {
 	return func(c *ConnectConfig) {
 		c.TransportType = transportType
+	}
+}
+
+// WithDialQUICWindowSizes 设置 QUIC 接收窗口大小。
+// initialStream/maxStream 控制每条流的接收窗口，initialConn/maxConn 控制整个连接的接收窗口。
+// 0 表示保持 quic-go 默认值（stream: 512KB/6MB，conn: 512KB/15MB）。
+func WithDialQUICWindowSizes(initialStream, maxStream, initialConn, maxConn uint64) ConnectOption {
+	return func(c *ConnectConfig) {
+		c.QUICInitialStreamReceiveWindow = initialStream
+		c.QUICMaxStreamReceiveWindow = maxStream
+		c.QUICInitialConnReceiveWindow = initialConn
+		c.QUICMaxConnReceiveWindow = maxConn
 	}
 }
 
@@ -606,15 +623,19 @@ func connectWithTransport(ctx context.Context, cfg ConnectConfig) (net.Conn, err
 
 	// 创建传输配置
 	transportCfg := transport.TransportClientConfig{
-		Type:         transportType,
-		RemoteAddr:   cfg.Addr,
-		ServerName:   cfg.ServerName,
-		Insecure:     cfg.Insecure,
-		TLS:          cfg.TLS,
-		Context:      ctx,
-		Logger:       transport.NewSafeLoggerOrNull(nil),
-		Dialer:       cfg.Dialer,
-		ListenConfig: cfg.ListenConfig,
+		Type:                           transportType,
+		RemoteAddr:                     cfg.Addr,
+		ServerName:                     cfg.ServerName,
+		Insecure:                       cfg.Insecure,
+		TLS:                            cfg.TLS,
+		Context:                        ctx,
+		Logger:                         transport.NewSafeLoggerOrNull(nil),
+		Dialer:                         cfg.Dialer,
+		ListenConfig:                   cfg.ListenConfig,
+		QUICInitialStreamReceiveWindow: cfg.QUICInitialStreamReceiveWindow,
+		QUICMaxStreamReceiveWindow:     cfg.QUICMaxStreamReceiveWindow,
+		QUICInitialConnReceiveWindow:   cfg.QUICInitialConnReceiveWindow,
+		QUICMaxConnReceiveWindow:       cfg.QUICMaxConnReceiveWindow,
 	}
 
 	// 复用全局传输管理器，避免每次拨号都重新分配 map 和工厂对象
