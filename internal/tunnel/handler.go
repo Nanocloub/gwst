@@ -21,6 +21,10 @@ const (
 	DefaultUDPDialReadTimeout     = time.Second * 2
 	DefaultUDPEarlyDataHeaderName = "Sec-WebSocket-Protocol"
 	DefaultUDPMaxEarlyDataSize    = 4 * 1024
+	// DefaultUDPIdleTimeout 是 UDP 后端连接的读取空闲超时。
+	// 若后端在此时间内无响应（如静默崩溃、无 ICMP），读操作返回超时错误，
+	// 触发连接清理，避免 goroutine/内存泄露。
+	DefaultUDPIdleTimeout = 2 * time.Minute
 )
 
 // NamedTarget 命名的目标地址配置
@@ -34,7 +38,6 @@ type NamedTarget struct {
 
 type GetTargetFunc func(req *http.Request) (string, []string, error)
 
-// 导出接口别名以支持向后兼容
 type Logger = utils.Logger
 type CryptoManager = utils.CryptoManager
 type deadlineWriter = utils.DeadlineWriter
@@ -45,7 +48,8 @@ type Handler struct {
 	allowedTargets         map[string][]string
 	namedTargets           map[string]NamedTarget
 	wsServer               *websocket.Server
-	bufferPool             *sync.Pool
+	bufferPool             *sync.Pool // 65KB pool，供 UDP 路径使用
+	tcpCopyPool            *sync.Pool // 16KB pool，供 TCP 双向复制使用
 	closeChan              chan struct{}
 	cryptoManager          CryptoManager
 	key                    string
@@ -55,6 +59,7 @@ type Handler struct {
 	connectionsWg          sync.WaitGroup
 	bufferSize             int
 	udpDialReadTimeout     time.Duration
+	udpIdleTimeout         time.Duration
 	closeOnce              sync.Once
 	disableTCPProtocol     bool
 	disableUDPProtocol     bool
@@ -62,6 +67,21 @@ type Handler struct {
 }
 
 type HandlerOption func(*Handler)
+
+// udpTargetConn 为 UDP 后端连接的 Read 加入滚动空闲超时。
+// 每次 Read 调用前重置读 deadline，确保后端静默崩溃（无 ICMP）时
+// 读取在 idleTimeout 内退出，触发上层连接清理，避免 goroutine 泄露。
+type udpTargetConn struct {
+	net.Conn
+	idleTimeout time.Duration
+}
+
+func (u *udpTargetConn) Read(b []byte) (int, error) {
+	if err := u.Conn.SetReadDeadline(time.Now().Add(u.idleTimeout)); err != nil {
+		return 0, err
+	}
+	return u.Conn.Read(b)
+}
 
 func WithHandlerLogger(logger Logger) HandlerOption {
 	return func(h *Handler) {
@@ -116,6 +136,12 @@ func WithHandlerLoadBalance(loadBalance bool) HandlerOption {
 func WithHandlerUDPDialReadTimeout(timeout time.Duration) HandlerOption {
 	return func(h *Handler) {
 		h.udpDialReadTimeout = timeout
+	}
+}
+
+func WithHandlerUDPIdleTimeout(timeout time.Duration) HandlerOption {
+	return func(h *Handler) {
+		h.udpIdleTimeout = timeout
 	}
 }
 
@@ -191,9 +217,14 @@ func NewHandler(opts ...HandlerOption) *Handler {
 	}
 
 	h.bufferPool = utils.NewBufferPool(utils.UDPBufferSize)
+	h.tcpCopyPool = utils.NewBufferPool(utils.DefaultBufferSize)
 
 	if h.udpDialReadTimeout == 0 {
 		h.udpDialReadTimeout = DefaultUDPDialReadTimeout
+	}
+
+	if h.udpIdleTimeout == 0 {
+		h.udpIdleTimeout = DefaultUDPIdleTimeout
 	}
 
 	if h.udpEarlyDataHeaderName == "" {
@@ -336,13 +367,13 @@ func (h *Handler) decryptUDPData(buffer *[]byte, encryptedData []byte) (int, err
 		// 无加密时直接复制
 		return copy(*buffer, encryptedData), nil
 	}
-	
+
 	// 直接解密到目标 buffer，避免中间缓冲区
 	decrypted, err := h.cryptoManager.DecryptTo(*buffer, encryptedData)
 	if err != nil {
 		return 0, err
 	}
-	
+
 	return len(decrypted), nil
 }
 
@@ -363,47 +394,21 @@ func (h *Handler) handle(ws *websocket.Conn, network, addr string, fallbackAddrs
 		for {
 			select {
 			case <-ticker.C:
-				// 尝试获取锁，使用非阻塞方式避免死锁和goroutine泄漏
-				lockCtx, lockCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				
-				locked := make(chan bool, 1)
-				
-				go func() {
-					writeMu.Lock()
-					select {
-					case locked <- true:
-						// 成功通知
-					case <-lockCtx.Done():
-						// 超时了，释放锁
-						writeMu.Unlock()
-					}
-				}()
-
-				select {
-				case <-locked:
-					// 成功获取锁，发送 ping
-					ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
-					err := pingCodec.Send(ws, nil)
-					if err == nil {
-						ws.SetReadDeadline(time.Now().Add(90 * time.Second))
-						ws.SetWriteDeadline(time.Time{})
-						writeMu.Unlock()
-						lockCancel()
-						continue
-					}
-					writeMu.Unlock()
-					lockCancel()
-
+				// TryLock: 如果写锁正在被数据拷贝 goroutine 持有，直接跳过本次 ping。
+				// 避免产生阻塞在 Lock() 上的孤儿 goroutine，消除锁泄漏风险。
+				if !writeMu.TryLock() {
+					continue
+				}
+				ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				err := pingCodec.Send(ws, nil)
+				ws.SetWriteDeadline(time.Time{})
+				writeMu.Unlock()
+				if err != nil {
 					h.log.Errorf("Failed to send ping: %v", err)
 					_ = ws.Close()
 					return
-
-				case <-lockCtx.Done():
-					// 超时，跳过本次 ping（goroutine 会自动释放锁）
-					lockCancel()
-					h.log.Warn("Failed to acquire write lock for ping within 5s, skipping this ping cycle")
-					continue
 				}
+				ws.SetReadDeadline(time.Now().Add(90 * time.Second))
 			case <-h.closeChan:
 				h.log.Infof("Closing connection due to shutdown")
 				_ = ws.Close()
@@ -445,7 +450,11 @@ func (h *Handler) handleUDP(ws *websocket.Conn, addr string, fallbackAddrs []str
 		}
 
 		// 解密 early data（如果启用加密）
-		n, err = h.decryptUDPData(buffer, (*buffer)[:n])
+		// 注意：必须先将密文复制到独立切片，避免 DecryptTo 的 dst(*buffer) 和
+		// src((*buffer)[:n]) 指向同一内存，原地解密在部分 AEAD 实现中不安全。
+		ciphertext := make([]byte, n)
+		copy(ciphertext, (*buffer)[:n])
+		n, err = h.decryptUDPData(buffer, ciphertext)
 		if err != nil {
 			h.log.Errorf("Failed to decrypt X-0RTT header: %v", err)
 			return
@@ -489,7 +498,7 @@ func (h *Handler) handleUDP(ws *websocket.Conn, addr string, fallbackAddrs []str
 		h.log.Errorf("Failed to connect to UDP target: %v", err)
 		return
 	}
-	
+
 	// 使用 sync.Once 确保连接只关闭一次
 	var closeOnce sync.Once
 	closeConn := func() { closeOnce.Do(func() { conn.Close() }) }
@@ -510,7 +519,7 @@ func (h *Handler) handleUDP(ws *websocket.Conn, addr string, fallbackAddrs []str
 	}
 
 	var wg sync.WaitGroup
-	
+
 	// 启动读取 goroutine：从 Tunnel 读取并写入 Target
 	wg.Add(1)
 	go func() {
@@ -527,12 +536,20 @@ func (h *Handler) handleUDP(ws *websocket.Conn, addr string, fallbackAddrs []str
 	}()
 
 	// UDP: Read from Target -> Encrypt -> Write to Tunnel
+	// 使用 udpTargetConn 包装：每次 Read 前重置读 deadline，
+	// 若后端静默崩溃（无 ICMP），最多等待 udpIdleTimeout 后退出。
 	writeBuffer := utils.GetBuffer(h.bufferPool)
 	defer utils.PutBuffer(h.bufferPool, writeBuffer)
-	if _, err := utils.CopyBufferWithWriteTimeout(tunnelConn.(utils.DeadlineWriter), conn, *writeBuffer, utils.DefaultWriteTimeout); err != nil &&
+	if _, err := utils.CopyBufferWithWriteTimeout(tunnelConn.(utils.DeadlineWriter), &udpTargetConn{Conn: conn, idleTimeout: h.udpIdleTimeout}, *writeBuffer, utils.DefaultWriteTimeout); err != nil &&
 		!errors.Is(err, net.ErrClosed) {
 		h.log.Infof("Failed to copy data from Target to Tunnel: %v", err)
 	}
+
+	// 主方向结束后主动关闭双端：关闭 UDP 目标连接（让 goroutine 的下次 Write 立即失败），
+	// 关闭 WebSocket（让 goroutine 的 tunnelConn.Read 立即返回错误），避免 goroutine
+	// 阻塞在半关闭状态直到 OS keepalive 超时。
+	closeConn()
+	ws.Close()
 
 	// Wait for the copy goroutine to finish
 	wg.Wait()
@@ -544,7 +561,7 @@ func (h *Handler) handleNetwork(ws *websocket.Conn, network, addr string, fallba
 		h.log.Errorf("Failed to connect to target: %v", err)
 		return
 	}
-	
+
 	// 使用 sync.Once 确保连接只关闭一次
 	var closeOnce sync.Once
 	closeConn := func() { closeOnce.Do(func() { conn.Close() }) }
@@ -562,8 +579,8 @@ func (h *Handler) handleNetwork(ws *websocket.Conn, network, addr string, fallba
 	go func() {
 		defer wg.Done()
 		defer closeConn() // 使用 sync.Once 包装的关闭函数
-		buffer := utils.GetBuffer(h.bufferPool)
-		defer utils.PutBuffer(h.bufferPool, buffer)
+		buffer := utils.GetBuffer(h.tcpCopyPool)
+		defer utils.PutBuffer(h.tcpCopyPool, buffer)
 
 		// Direction: Tunnel(ws) -> Target(conn)
 		// WebSocket 模式下，每次 Read 都会获取完整消息，不会有帧交错问题
@@ -573,14 +590,18 @@ func (h *Handler) handleNetwork(ws *websocket.Conn, network, addr string, fallba
 		}
 	}()
 
-	buffer := utils.GetBuffer(h.bufferPool)
-	defer utils.PutBuffer(h.bufferPool, buffer)
+	buffer := utils.GetBuffer(h.tcpCopyPool)
+	defer utils.PutBuffer(h.tcpCopyPool, buffer)
 
 	// Direction: Target(conn) -> Tunnel(ws)
 	if _, err := utils.CopyBufferWithWriteTimeout(tunnelConn.(utils.DeadlineWriter), conn, *buffer, utils.DefaultWriteTimeout); err != nil &&
 		!errors.Is(err, net.ErrClosed) {
 		h.log.Infof("Failed to copy data to Tunnel: %v", err)
 	}
+
+	// 主方向结束后主动关闭双端，让 goroutine 立即退出，避免半关闭状态积压。
+	closeConn()
+	ws.Close()
 
 	// Wait for the copy goroutine to finish
 	wg.Wait()
@@ -590,6 +611,7 @@ func dial(ctx context.Context, network, addr string, fallbackAddrs []string) (ne
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, network, addr)
 	if err == nil {
+		setTCPKeepAlive(conn)
 		return conn, nil
 	}
 
@@ -601,6 +623,7 @@ func dial(ctx context.Context, network, addr string, fallbackAddrs []string) (ne
 	for _, addr := range fallbackAddrs {
 		conn, batchErr := d.DialContext(ctx, "tcp", addr)
 		if batchErr == nil {
+			setTCPKeepAlive(conn)
 			return conn, nil
 		}
 
@@ -608,6 +631,15 @@ func dial(ctx context.Context, network, addr string, fallbackAddrs []string) (ne
 	}
 
 	return nil, errors.Join(errs...)
+}
+
+// setTCPKeepAlive 为 TCP 连接启用 keepalive，确保后端进程崩溃或异常退出时，
+// OS 能在 ~90s 内检测到死连接并返回错误，避免 goroutine 永久阻塞。
+func setTCPKeepAlive(conn net.Conn) {
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(30 * time.Second)
+	}
 }
 
 func (h *Handler) dialUDP(
@@ -752,25 +784,39 @@ func (h *Handler) HandleRawConnection(conn net.Conn, protocol, target string, fa
 		h.log.Errorf("Failed to connect to target: %v", err)
 		return err
 	}
-	
+
 	// 使用 sync.Once 确保连接只关闭一次
 	var closeOnce sync.Once
 	closeConn := func() { closeOnce.Do(func() { targetConn.Close() }) }
 	defer closeConn() // 异常安全：确保 panic 时也能关闭连接
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var writeMu sync.Mutex
+
+	// Stream keepalive: 设置初始读超时，由 keepalive goroutine 定期刷新。
+	// 若隧道连接断开，keepalive 写入失败 → 停止刷新 → 读超时触发 → 连接清理。
+	conn.SetReadDeadline(time.Now().Add(utils.StreamReadTimeout))
+
+	// Stream keepalive goroutine：与 WebSocket 模式的 ping goroutine 功能相同，
+	// 发送零长度帧 [0x00, 0x00] 作为心跳，CryptoConn.Read() 会自动跳过零长度帧。
+	go h.streamKeepalive(ctx, conn, &writeMu)
 
 	var wg sync.WaitGroup
 
 	// Stream 模式：创建单个 CryptoConn 实例处理双向加密通信
 	// - 帧协议：[Len(2)][EncryptedPayload] 确保边界清晰
 	// - 并发安全：CryptoConn 内部 readMu 保护读缓冲，读写可并发
-	tunnelConn := utils.NewCryptoConn(conn, h.cryptoManager, true)
+	// - LockedConn：写入加锁，与 keepalive goroutine 共享 writeMu
+	tunnelConn := utils.NewCryptoConn(&utils.LockedConn{Conn: conn, Mu: &writeMu}, h.cryptoManager, true)
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		defer closeConn() // 使用 sync.Once 包装的关闭函数
-		buffer := utils.GetBuffer(h.bufferPool)
-		defer utils.PutBuffer(h.bufferPool, buffer)
+		buffer := utils.GetBuffer(h.tcpCopyPool)
+		defer utils.PutBuffer(h.tcpCopyPool, buffer)
 
 		// Direction: Tunnel(conn) -> Target(targetConn)
 		if _, err := utils.CopyBufferWithWriteTimeout(targetConn, tunnelConn, *buffer, utils.DefaultWriteTimeout); err != nil &&
@@ -779,8 +825,8 @@ func (h *Handler) HandleRawConnection(conn net.Conn, protocol, target string, fa
 		}
 	}()
 
-	buffer := utils.GetBuffer(h.bufferPool)
-	defer utils.PutBuffer(h.bufferPool, buffer)
+	buffer := utils.GetBuffer(h.tcpCopyPool)
+	defer utils.PutBuffer(h.tcpCopyPool, buffer)
 
 	// Direction: Target(targetConn) -> Tunnel(conn)
 	if _, err := utils.CopyBufferWithWriteTimeout(tunnelConn.(deadlineWriter), targetConn, *buffer, utils.DefaultWriteTimeout); err != nil &&
@@ -788,8 +834,50 @@ func (h *Handler) HandleRawConnection(conn net.Conn, protocol, target string, fa
 		h.log.Infof("Failed to copy data to Tunnel: %v", err)
 	}
 
+	// 主方向结束后主动关闭双端，让 goroutine 立即退出，避免半关闭状态积压。
+	closeConn()
+	conn.Close()
+
 	wg.Wait()
 	return nil
+}
+
+// streamKeepalive 为 TCP/QUIC 流式隧道连接提供应用层心跳。
+// 功能等同于 WebSocket 模式的 ping goroutine：
+//   - 每 30s 发送零长度帧 [0x00, 0x00] 作为心跳
+//   - 刷新读超时（90s），若隧道断开，心跳写入失败 → 读超时未刷新 → 读操作超时退出
+//   - CryptoConn.Read() 的 stream 模式自动跳过 ln==0 的帧
+func (h *Handler) streamKeepalive(ctx context.Context, conn net.Conn, writeMu *sync.Mutex) {
+	ticker := time.NewTicker(utils.StreamKeepaliveInterval)
+	defer ticker.Stop()
+
+	keepaliveFrame := []byte{0, 0}
+
+	for {
+		select {
+		case <-ticker.C:
+			// TryLock: 若数据拷贝正在写入，跳过本次心跳，避免阻塞。
+			if !writeMu.TryLock() {
+				continue
+			}
+			conn.SetWriteDeadline(time.Now().Add(utils.StreamKeepaliveWriteTimeout))
+			_, err := conn.Write(keepaliveFrame)
+			conn.SetWriteDeadline(time.Time{})
+			writeMu.Unlock()
+			if err != nil {
+				h.log.Infof("Stream keepalive write failed: %v", err)
+				conn.Close()
+				return
+			}
+			conn.SetReadDeadline(time.Now().Add(utils.StreamReadTimeout))
+		case <-h.closeChan:
+			h.log.Infof("Closing stream connection due to shutdown")
+			conn.Close()
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // handleRawUDP 处理原始连接上的 UDP 流量（用于 TCP/QUIC 传输）
@@ -801,18 +889,30 @@ func (h *Handler) handleRawUDP(conn net.Conn, addr string, fallbackAddrs []strin
 		h.log.Errorf("Failed to connect to UDP target: %v", err)
 		return err
 	}
-	
+
 	// 使用 sync.Once 确保连接只关闭一次
 	var closeOnce sync.Once
 	closeConn := func() { closeOnce.Do(func() { targetConn.Close() }) }
 	defer closeConn() // 异常安全：确保 panic 时也能关闭连接
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var writeMu sync.Mutex
+
+	// Stream keepalive: 设置初始读超时
+	conn.SetReadDeadline(time.Now().Add(utils.StreamReadTimeout))
+
+	// Stream keepalive goroutine
+	go h.streamKeepalive(ctx, conn, &writeMu)
 
 	var wg sync.WaitGroup
 
 	// Stream 模式的 UDP：使用 CryptoConn 统一处理加密和帧封装
 	// - 即使无加密（cryptoManager=nil），也需要帧协议保证 UDP 包边界
 	// - 并发安全：内部 readMu 保护，读写可在不同 goroutine 并发执行
-	tunnelConn := utils.NewCryptoConn(conn, h.cryptoManager, true)
+	// - LockedConn：写入加锁，与 keepalive goroutine 共享 writeMu
+	tunnelConn := utils.NewCryptoConn(&utils.LockedConn{Conn: conn, Mu: &writeMu}, h.cryptoManager, true)
 
 	// 从客户端读取，写入目标（客户端 -> 服务端 -> 目标）
 	wg.Add(1)
@@ -830,19 +930,23 @@ func (h *Handler) handleRawUDP(conn net.Conn, addr string, fallbackAddrs []strin
 	}()
 
 	// 从目标读取，写入客户端（目标 -> 服务端 -> 客户端）
+	// 必须使用 CopyBufferWithWriteTimeout：若客户端停止读取但保持 TCP 连接，
+	// io.CopyBuffer 会永久阻塞在 tunnelConn.Write() 上，导致后续的 closeConn()
+	// 和 conn.Close() 永远无法执行，造成 goroutine/连接泄露。
+	// 使用 udpTargetConn 包装：每次 Read 前重置读 deadline，
+	// 若后端静默崩溃（无 ICMP），最多等待 udpIdleTimeout 后退出。
 	buffer := utils.GetBuffer(h.bufferPool)
 	defer utils.PutBuffer(h.bufferPool, buffer)
 
-	if _, err := io.CopyBuffer(tunnelConn, targetConn, *buffer); err != nil &&
+	if _, err := utils.CopyBufferWithWriteTimeout(tunnelConn.(deadlineWriter), &udpTargetConn{Conn: targetConn, idleTimeout: h.udpIdleTimeout}, *buffer, utils.DefaultWriteTimeout); err != nil &&
 		!errors.Is(err, net.ErrClosed) {
 		h.log.Infof("Failed to copy data from UDP Target to Tunnel: %v", err)
 	}
 
+	// 主方向结束后主动关闭双端，让 goroutine 立即退出，避免半关闭状态积压。
+	closeConn()
+	conn.Close()
+
 	wg.Wait()
 	return nil
 }
-
-func isStreamConn(conn net.Conn) bool {
-	return utils.IsStreamConn(conn)
-}
-

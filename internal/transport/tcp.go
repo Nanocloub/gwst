@@ -54,40 +54,41 @@ func (tst *TCPServerTransport) Serve() error {
 		close(tst.shutdowned)
 	})
 
-	var listener net.Listener
-	var err error
-
+	var tlsConfig *tls.Config
 	if tst.config.TLS {
 		if tst.config.CertFile == "" || tst.config.KeyFile == "" {
 			tst.listenErr = errors.New("cert_file and key_file are required for TLS")
 			return tst.listenErr
 		}
 
-		tlsConfig, err := tls.LoadX509KeyPair(tst.config.CertFile, tst.config.KeyFile)
+		cert, err := tls.LoadX509KeyPair(tst.config.CertFile, tst.config.KeyFile)
 		if err != nil {
 			tst.listenErr = fmt.Errorf("failed to load TLS certificates: %w", err)
 			return tst.listenErr
 		}
 
-		tcpListener, err := net.Listen("tcp", tst.config.ListenAddr)
-		if err != nil {
-			tst.listenErr = fmt.Errorf("failed to listen: %w", err)
-			return tst.listenErr
-		}
-
-		listener = tls.NewListener(tcpListener, &tls.Config{
-			Certificates: []tls.Certificate{tlsConfig},
+		tlsConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS13,
-		})
-	} else {
-		listener, err = net.Listen("tcp", tst.config.ListenAddr)
-		if err != nil {
-			tst.listenErr = fmt.Errorf("failed to listen: %w", err)
-			return tst.listenErr
 		}
 	}
 
-	tst.listener = listener
+	// 使用 net.ListenTCP 以便 AcceptTCP() 获取 *net.TCPConn，
+	// 从而在连接建立时立即开启 TCP keepalive，确保异常断开的客户端
+	// 能在 ~90s 内被检测到（3×30s 探测），避免 gwst→后端连接无限积压。
+	tcpAddr, err := net.ResolveTCPAddr("tcp", tst.config.ListenAddr)
+	if err != nil {
+		tst.listenErr = fmt.Errorf("failed to resolve address: %w", err)
+		return tst.listenErr
+	}
+
+	tcpListener, err := net.ListenTCP("tcp", tcpAddr)
+	if err != nil {
+		tst.listenErr = fmt.Errorf("failed to listen: %w", err)
+		return tst.listenErr
+	}
+
+	tst.listener = tcpListener
 
 	tst.onListenOnce.Do(func() {
 		close(tst.onListened)
@@ -101,7 +102,7 @@ func (tst *TCPServerTransport) Serve() error {
 
 	// Accept connections
 	for {
-		conn, err := listener.Accept()
+		tcpConn, err := tcpListener.AcceptTCP()
 		if err != nil {
 			select {
 			case <-tst.closeChan:
@@ -113,6 +114,17 @@ func (tst *TCPServerTransport) Serve() error {
 				tst.config.Logger.Infof("Accept error: %v", err)
 				continue
 			}
+		}
+
+		// 开启 TCP keepalive：OS 将在 30s 空闲后每 30s 发送 keepalive 探测，
+		// 3 次无响应（约 90s）后判定对端死亡并触发 ECONNRESET/EOF，
+		// 使 gwst 的 goroutine 及时退出并释放后端连接。
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+
+		var conn net.Conn = tcpConn
+		if tlsConfig != nil {
+			conn = tls.Server(tcpConn, tlsConfig)
 		}
 
 		tst.connectionWg.Add(1)
@@ -172,7 +184,8 @@ func (tst *TCPServerTransport) Close() error {
 // TCPClientTransport TCP 客户端传输实现
 type TCPClientTransport struct {
 	config TransportClientConfig
-	conn   net.Conn
+	dialer *net.Dialer // 预构建，不可变
+	tlsCfg *tls.Config // 预构建，不可变；nil 表示无 TLS
 	mu     sync.Mutex
 	closed bool
 }
@@ -191,72 +204,68 @@ func NewTCPClientTransport(cfg TransportClientConfig) (*TCPClientTransport, erro
 		cfg.Context = context.Background()
 	}
 
+	dialer := cfg.Dialer
+	if dialer == nil {
+		dialer = &net.Dialer{
+			Timeout: 5 * time.Second,
+		}
+	}
+
+	var tlsCfg *tls.Config
+	if cfg.TLS {
+		tlsCfg = &tls.Config{
+			ServerName:         cfg.ServerName,
+			InsecureSkipVerify: cfg.Insecure,
+			MinVersion:         tls.VersionTLS13,
+		}
+	}
+
 	return &TCPClientTransport{
 		config: cfg,
+		dialer: dialer,
+		tlsCfg: tlsCfg,
 	}, nil
 }
 
-// Dial 建立 TCP 连接
+// Dial 建立 TCP 连接。
+//
+// 并发安全：mu 仅用于保护 closed 字段，在 I/O 操作（DialContext / TLS
+// Handshake）期间不持锁，允许多个 goroutine 并发建立连接。
 func (tct *TCPClientTransport) Dial(ctx context.Context) (net.Conn, error) {
 	tct.mu.Lock()
-	defer tct.mu.Unlock()
-
 	if tct.closed {
+		tct.mu.Unlock()
 		return nil, net.ErrClosed
 	}
-
-	dialer := tct.config.Dialer
-	if dialer == nil {
-		dialer = &net.Dialer{
-			Timeout: time.Second * 5,
-		}
-	}
+	tct.mu.Unlock() // 释放锁，后续 I/O 不持锁
 
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	conn, err := dialer.DialContext(ctx, "tcp", tct.config.RemoteAddr)
+	conn, err := tct.dialer.DialContext(ctx, "tcp", tct.config.RemoteAddr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial: %w", err)
 	}
 
-	// Handle TLS if needed
-	if tct.config.TLS {
-		tlsConn := tls.Client(conn, &tls.Config{
-			ServerName:         tct.config.ServerName,
-			InsecureSkipVerify: tct.config.Insecure,
-			MinVersion:         tls.VersionTLS13,
-		})
-
-		// Perform handshake
-		if err := tlsConn.Handshake(); err != nil {
+	if tct.tlsCfg != nil {
+		// tls.Client 复用预构建的 tlsCfg（不可变），无需每次分配
+		tlsConn := tls.Client(conn, tct.tlsCfg)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			conn.Close()
 			return nil, fmt.Errorf("TLS handshake failed: %w", err)
 		}
-
-		tct.conn = tlsConn
-	} else {
-		tct.conn = conn
+		return tlsConn, nil
 	}
 
-	return tct.conn, nil
+	return conn, nil
 }
 
-// Close 关闭 TCP 连接
+// Close 关闭 TCP 传输（标记为关闭；各连接在 handler 层面由调用方关闭）
 func (tct *TCPClientTransport) Close() error {
 	tct.mu.Lock()
 	defer tct.mu.Unlock()
 
-	if tct.closed {
-		return nil
-	}
-
 	tct.closed = true
-
-	if tct.conn != nil {
-		return tct.conn.Close()
-	}
-
 	return nil
 }

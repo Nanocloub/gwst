@@ -242,17 +242,14 @@ func Connect(ctx context.Context, opts ...ConnectOption) (net.Conn, error) {
 }
 
 func ConnectWithConfig(ctx context.Context, cfg ConnectConfig) (net.Conn, error) {
-	// 如果未指定 transport，默认使用 websocket
 	if cfg.TransportType == "" {
 		cfg.TransportType = "websocket"
 	}
 
-	// 对于 TCP 和 QUIC 传输，使用 transport 包
 	if cfg.TransportType == "tcp" || cfg.TransportType == "quic" {
 		return connectWithTransport(ctx, cfg)
 	}
 
-	// 对于 WebSocket，使用原来的实现
 	if cfg.Addr == "" && len(cfg.FallbackAddrs) > 0 {
 		cfg.Addr = cfg.FallbackAddrs[0]
 		cfg.FallbackAddrs = cfg.FallbackAddrs[1:]
@@ -270,7 +267,6 @@ func ConnectWithConfig(ctx context.Context, cfg ConnectConfig) (net.Conn, error)
 	ws, err := connect(ctx, dialCfg)
 	if err == nil {
 		ws.PayloadType = websocket.BinaryFrame
-		// 统一使用 CryptoConn 处理加密、消息边界（WebSocket）
 		return utils.NewCryptoConn(ws, cfg.CryptoManager, false), nil
 	}
 
@@ -287,7 +283,6 @@ func ConnectWithConfig(ctx context.Context, cfg ConnectConfig) (net.Conn, error)
 		ws, cerr := connectConcurrent(ctx, dialCfg, batch)
 		if cerr == nil {
 			ws.PayloadType = websocket.BinaryFrame
-			// 统一使用 CryptoConn 处理加密、消息边界（WebSocket）
 			return utils.NewCryptoConn(ws, cfg.CryptoManager, false), nil
 		}
 
@@ -622,8 +617,8 @@ func connectWithTransport(ctx context.Context, cfg ConnectConfig) (net.Conn, err
 		ListenConfig: cfg.ListenConfig,
 	}
 
-	// 创建传输管理器
-	tm := transport.NewTransportManager()
+	// 复用全局传输管理器，避免每次拨号都重新分配 map 和工厂对象
+	tm := transport.GetTransportManager()
 
 	// 创建客户端传输
 	clientTransport, err := tm.CreateClientTransport(transportCfg)
@@ -648,6 +643,6 @@ func connectWithTransport(ctx context.Context, cfg ConnectConfig) (net.Conn, err
 		return nil, fmt.Errorf("failed to write protocol byte: %w", err)
 	}
 
-	// 统一使用 CryptoConn 处理加密、帧封装（Stream）
-	return utils.NewCryptoConn(conn, cfg.CryptoManager, true), nil
+	// 使用 StreamKeepaliveConn 处理加密、帧封装和应用层心跳（Stream）
+	return utils.NewStreamKeepaliveConn(conn, cfg.CryptoManager), nil
 }

@@ -22,6 +22,10 @@ type QUICServerTransport struct {
 	connectionWg sync.WaitGroup
 	onListenOnce sync.Once
 	shutdownOnce sync.Once
+	// ctx/cancel: 用于在 Close() 时取消所有 Accept/AcceptStream，
+	// 使 handleConnection goroutine 能快速退出（避免固定 5 秒等待）。
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // NewQUICServerTransport 创建 QUIC 服务端传输
@@ -55,6 +59,11 @@ func NewQUICServerTransport(cfg TransportServerConfig) (*QUICServerTransport, er
 
 // Serve 启动 QUIC 服务
 func (qst *QUICServerTransport) Serve() error {
+	// 创建生命周期 context；Close() 调用 cancel() 通知所有阻塞的 Accept/AcceptStream
+	ctx, cancel := context.WithCancel(context.Background())
+	qst.ctx = ctx
+	qst.cancel = cancel
+	defer cancel() // 始终释放 context 资源；cancel 多次调用是幂等的
 	defer qst.onListenOnce.Do(func() {
 		close(qst.onListened)
 	})
@@ -77,8 +86,9 @@ func (qst *QUICServerTransport) Serve() error {
 
 	// Create QUIC listener
 	listener, err := quic.ListenAddr(qst.config.ListenAddr, tlsConfig, &quic.Config{
-		MaxIdleTimeout:  time.Minute * 5,
-		KeepAlivePeriod: time.Second * 30,
+		MaxIdleTimeout:    2 * time.Minute,
+		KeepAlivePeriod:   30 * time.Second,
+		InitialPacketSize: 1452, // 直接使用 quic-go 允许的最大包大小，跳过 PMTU 热身
 	})
 	if err != nil {
 		qst.listenErr = err
@@ -95,9 +105,9 @@ func (qst *QUICServerTransport) Serve() error {
 
 	// Accept connections
 	for {
-		conn, err := listener.Accept(context.Background())
+		conn, err := listener.Accept(qst.ctx)
 		if err != nil {
-			if errors.Is(err, quic.ErrServerClosed) {
+			if errors.Is(err, quic.ErrServerClosed) || qst.ctx.Err() != nil {
 				return nil
 			}
 			qst.config.Logger.Errorf("Failed to accept QUIC connection: %v", err)
@@ -111,18 +121,24 @@ func (qst *QUICServerTransport) Serve() error {
 
 // handleConnection 处理单个 QUIC 连接
 func (qst *QUICServerTransport) handleConnection(conn quic.Connection) {
+	// defer 顺序（LIFO）：
+	//   3. connectionWg.Done()      — 最后执行，通知 Close() 本连接已完全清理
+	//   2. streamWg.Wait()          — 等待所有流 goroutine 退出
+	//   1. conn.CloseWithError(...) — 最先执行，强制终止所有流 I/O，使 goroutine 快速退出
 	defer qst.connectionWg.Done()
+	var streamWg sync.WaitGroup
+	defer streamWg.Wait()
 	defer conn.CloseWithError(0, "connection closed")
 
-	// Accept streams
 	for {
-		stream, err := conn.AcceptStream(context.Background())
+		stream, err := conn.AcceptStream(qst.ctx)
 		if err != nil {
 			return
 		}
 
-		// Handle each stream as a separate connection
+		streamWg.Add(1)
 		go func(s quic.Stream) {
+			defer streamWg.Done()
 			defer s.Close()
 			if err := qst.config.Handler(&quicStreamWrapper{Stream: s}); err != nil {
 				qst.config.Logger.Infof("Stream handler error: %v", err)
@@ -145,11 +161,16 @@ func (qst *QUICServerTransport) WaitShutdown() <-chan struct{} {
 // Close 关闭 QUIC 服务
 func (qst *QUICServerTransport) Close() error {
 	qst.shutdownOnce.Do(func() {
+		// 先取消 context：使所有阻塞在 Accept/AcceptStream 的 goroutine 立即返回
+		if qst.cancel != nil {
+			qst.cancel()
+		}
+
 		if qst.listener != nil {
 			qst.listener.Close()
 		}
 
-		// Wait for all connections to close
+		// 等待所有连接 goroutine 退出（现在有 ctx 取消，不会长时间阻塞）
 		done := make(chan struct{})
 		go func() {
 			qst.connectionWg.Wait()
@@ -171,14 +192,22 @@ func (qst *QUICServerTransport) Close() error {
 	return nil
 }
 
-// QUICClientTransport QUIC 客户端传输实现
+// QUICClientTransport QUIC 客户端传输实现。
+//
+// 持有一个持久 QUIC 连接，每次 Dial 在该连接上开新流（stream multiplexing），
+// 避免每次建立隧道都触发 TLS 1.3 完整握手（高延迟场景代价显著）。
+// 当底层连接断开时，下次 Dial 自动重建。
 type QUICClientTransport struct {
-	config TransportClientConfig
-	mu     sync.Mutex
-	closed bool
+	config      TransportClientConfig
+	mu          sync.Mutex      // 保护 conn 和 closed 字段；持有时间短
+	reconnectMu sync.Mutex      // 序列化重连操作（持有期间可能阻塞 dialNewConn）
+	conn        quic.Connection // 持久复用的 QUIC 连接；nil 表示尚未建立或已失效
+	tlsCfg      *tls.Config     // 预构建，不可变，避免每次 Dial 重复分配
+	quicCfg     *quic.Config    // 预构建，不可变
+	closed      bool
 }
 
-// NewQUICClientTransport 创建 QUIC 客户端传输
+// NewQUICClientTransport 创建 QUIC 客户端传输，预构建 TLS/QUIC 配置以避免运行时重复分配。
 func NewQUICClientTransport(cfg TransportClientConfig) (*QUICClientTransport, error) {
 	if cfg.RemoteAddr == "" {
 		return nil, errors.New("remote_addr is required")
@@ -192,83 +221,157 @@ func NewQUICClientTransport(cfg TransportClientConfig) (*QUICClientTransport, er
 		cfg.Context = context.Background()
 	}
 
-	return &QUICClientTransport{
-		config: cfg,
-	}, nil
-}
-
-// Dial 建立 QUIC 连接
-func (qct *QUICClientTransport) Dial(ctx context.Context) (net.Conn, error) {
-	qct.mu.Lock()
-	defer qct.mu.Unlock()
-
-	if qct.closed {
-		return nil, net.ErrClosed
-	}
-
-	tlsConfig := &tls.Config{
-		ServerName:         qct.config.ServerName,
-		InsecureSkipVerify: qct.config.Insecure,
+	tlsCfg := &tls.Config{
+		ServerName:         cfg.ServerName,
+		InsecureSkipVerify: cfg.Insecure,
 		NextProtos:         []string{"gwst-quic"},
 		MinVersion:         tls.VersionTLS13,
 	}
 
-	quicConf := &quic.Config{
-		MaxIdleTimeout:  time.Minute * 5,
-		KeepAlivePeriod: time.Second * 30,
+	quicCfg := &quic.Config{
+		MaxIdleTimeout:  2 * time.Minute,
+		KeepAlivePeriod: 30 * time.Second,
+		// 直接使用 quic-go 允许的最大包大小（1452 字节），跳过从 1280 开始的
+		// PMTU 探测热身阶段。对于本地/局域网场景（loopback MTU=65535）可立即
+		// 使用最大包，减少同等数据量所需的 UDP 数据包数。
+		InitialPacketSize: 1452,
 	}
 
-	var conn quic.Connection
-	var err error
+	return &QUICClientTransport{
+		config:  cfg,
+		tlsCfg:  tlsCfg,
+		quicCfg: quicCfg,
+	}, nil
+}
 
-	// 使用自定义 ListenConfig 创建受保护的 UDP socket（Android VPN 场景）
+// isAlive 在持有外部锁的情况下安全检查 transport 是否可用。
+// 调用者必须持有 mu。
+func (qct *QUICClientTransport) isAlive() bool {
+	return !qct.closed && (qct.conn == nil || qct.conn.Context().Err() == nil)
+}
+
+// dialNewConn 建立全新的 QUIC 连接。只读取不可变字段（config/tlsCfg/quicCfg），无需持锁。
+func (qct *QUICClientTransport) dialNewConn(ctx context.Context) (quic.Connection, error) {
 	if qct.config.ListenConfig != nil {
-		var pconn net.PacketConn
-		pconn, err = qct.config.ListenConfig.ListenPacket(ctx, "udp", "")
+		pconn, err := qct.config.ListenConfig.ListenPacket(ctx, "udp", "")
 		if err != nil {
 			return nil, fmt.Errorf("failed to create UDP socket: %w", err)
 		}
 		tr := &quic.Transport{Conn: pconn}
-		addr, resolveErr := net.ResolveUDPAddr("udp", qct.config.RemoteAddr)
-		if resolveErr != nil {
+		addr, err := net.ResolveUDPAddr("udp", qct.config.RemoteAddr)
+		if err != nil {
 			pconn.Close()
-			return nil, fmt.Errorf("failed to resolve remote addr: %w", resolveErr)
+			return nil, fmt.Errorf("failed to resolve remote addr: %w", err)
 		}
-		conn, err = tr.Dial(ctx, addr, tlsConfig, quicConf)
+		conn, err := tr.Dial(ctx, addr, qct.tlsCfg, qct.quicCfg)
 		if err != nil {
 			pconn.Close()
 			return nil, err
 		}
-	} else {
-		conn, err = quic.DialAddr(ctx, qct.config.RemoteAddr, tlsConfig, quicConf)
-		if err != nil {
-			return nil, err
+		return conn, nil
+	}
+	return quic.DialAddr(ctx, qct.config.RemoteAddr, qct.tlsCfg, qct.quicCfg)
+}
+
+// Dial 在持久 QUIC 连接上开一个新流。首次调用建立连接；后续调用复用连接，
+// 无需重新握手（stream multiplexing）。连接断开时自动重建。
+//
+// 并发设计：
+//   - mu 仅用于原子读取/清零 conn 字段（持有时间极短，微秒级）
+//   - OpenStreamSync 在无锁状态下调用，允许多个 goroutine 同时在同一 QUIC
+//     连接上并发开流，互不阻塞（quic.Connection 的方法是 goroutine-safe）
+//   - reconnectMu 序列化重连操作，确保最多一个 goroutine 执行 dialNewConn
+func (qct *QUICClientTransport) Dial(ctx context.Context) (net.Conn, error) {
+	// 快速路径：在 mu 保护下获取当前连接引用，然后立即释放 mu。
+	// OpenStreamSync 在锁外调用，允许并发流开启。
+	qct.mu.Lock()
+	if qct.closed {
+		qct.mu.Unlock()
+		return nil, net.ErrClosed
+	}
+	conn := qct.conn
+	if conn != nil && conn.Context().Err() != nil {
+		qct.conn = nil
+		conn = nil
+	}
+	qct.mu.Unlock()
+
+	if conn != nil {
+		stream, err := conn.OpenStreamSync(ctx) // 无锁调用，并发安全
+		if err == nil {
+			return &quicStreamConn{stream: stream, conn: conn}, nil
 		}
+		// 连接已失效，清零缓存
+		qct.mu.Lock()
+		if qct.conn == conn {
+			qct.conn = nil
+		}
+		qct.mu.Unlock()
 	}
 
-	// Open a new stream
-	stream, err := conn.OpenStreamSync(ctx)
+	// 慢路径：需要重建连接；用 reconnectMu 序列化，防止多个 goroutine 同时创建
+	qct.reconnectMu.Lock()
+	defer qct.reconnectMu.Unlock()
+
+	// 二次检查：持有 reconnectMu 期间可能已有其他 goroutine 完成了重连
+	qct.mu.Lock()
+	if qct.closed {
+		qct.mu.Unlock()
+		return nil, net.ErrClosed
+	}
+	conn = qct.conn
+	if conn != nil && conn.Context().Err() != nil {
+		qct.conn = nil
+		conn = nil
+	}
+	qct.mu.Unlock()
+
+	if conn != nil {
+		// 其他 goroutine 已重连，直接复用新连接开流（还是在锁外调用）
+		stream, err := conn.OpenStreamSync(ctx)
+		if err == nil {
+			return &quicStreamConn{stream: stream, conn: conn}, nil
+		}
+		qct.mu.Lock()
+		if qct.conn == conn {
+			qct.conn = nil
+		}
+		qct.mu.Unlock()
+	}
+
+	// 建立全新 QUIC 连接
+	newConn, err := qct.dialNewConn(ctx)
 	if err != nil {
-		conn.CloseWithError(0, "failed to open stream")
 		return nil, err
 	}
 
-	return &quicStreamConn{
-		stream: stream,
-		conn:   conn,
-	}, nil
+	stream, err := newConn.OpenStreamSync(ctx)
+	if err != nil {
+		newConn.CloseWithError(0, "failed to open stream")
+		return nil, err
+	}
+
+	qct.mu.Lock()
+	qct.conn = newConn
+	qct.mu.Unlock()
+	return &quicStreamConn{stream: stream, conn: newConn}, nil
 }
 
 // Close 关闭 QUIC 连接
 func (qct *QUICClientTransport) Close() error {
 	qct.mu.Lock()
-	defer qct.mu.Unlock()
-
 	if qct.closed {
+		qct.mu.Unlock()
 		return nil
 	}
-
 	qct.closed = true
+	conn := qct.conn
+	qct.conn = nil
+	qct.mu.Unlock() // 先释放 mu，再调网络 I/O（CloseWithError 发送 CONNECTION_CLOSE 帧）
+
+	if conn != nil {
+		return conn.CloseWithError(0, "transport closed")
+	}
 	return nil
 }
 
@@ -286,6 +389,10 @@ func (q *quicStreamWrapper) Write(b []byte) (int, error) {
 }
 
 func (q *quicStreamWrapper) Close() error {
+	// CancelRead 向对端发送 STOP_SENDING，立即终止流的接收方向，
+	// 防止在 handler 出错返回时流的读侧长期半开（resource leak）。
+	// 在成功路径上数据已全部读完，调用无副作用（幂等）。
+	q.Stream.CancelRead(0)
 	return q.Stream.Close()
 }
 
@@ -334,7 +441,10 @@ func (qc *quicStreamConn) RemoteAddr() net.Addr {
 }
 
 func (qc *quicStreamConn) Close() error {
-	// Close the stream
+	// 只关闭流；QUIC 连接由 QUICClientTransport 管理并复用于后续流。
+	// 流关闭会发送 STREAM FIN，对端 AcceptStream 侧能正常感知 EOF。
+	// CancelRead 同时取消接收方向，防止对端继续发送数据导致的半开流积压。
+	qc.stream.CancelRead(0)
 	return qc.stream.Close()
 }
 

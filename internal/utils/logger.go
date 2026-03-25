@@ -74,11 +74,14 @@ func (n *nullLogger) Warnf(string, ...any)  {}
 func (n *nullLogger) Error(...any)          {}
 func (n *nullLogger) Errorf(string, ...any) {}
 
+// sharedNullLogger 是全局单例，避免每次 NewSafeLoggerOrNull(nil) 都分配新对象
+var sharedNullLogger Logger = &nullLogger{}
+
 // NewSafeLoggerOrNull 创建一个安全的 logger，如果传入 nil 则返回 nullLogger
 // 这是一个便捷函数，避免在各处重复 nil 检查逻辑
 func NewSafeLoggerOrNull(logger Logger) Logger {
 	if logger != nil {
 		return logger
 	}
-	return &nullLogger{}
+	return sharedNullLogger
 }

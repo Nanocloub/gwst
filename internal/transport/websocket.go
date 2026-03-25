@@ -134,16 +134,23 @@ func (wst *WebSocketServerTransport) Serve() error {
 
 	wst.config.Logger.Infof("WebSocket server listening on %s", wst.config.ListenAddr)
 
-	// Start HTTP server
+	serverErr := make(chan error, 1)
 	go func() {
 		if err := wst.server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			wst.config.Logger.Errorf("Server error: %v", err)
+			serverErr <- err
 		}
 	}()
 
-	// Wait for shutdown signal or server error
-	<-wst.shutdowned
-	return nil
+	select {
+	case <-wst.shutdowned:
+		return nil
+	case err := <-serverErr:
+		// 服务器异常退出：强制关闭所有活跃连接，防止 handler goroutine 泄漏。
+		// Close() 后续调用 shutdownOnce.Do 为 no-op，故须在此主动清理。
+		_ = wst.server.Close()
+		return err
+	}
 }
 
 // handleConn 处理单个 WebSocket 连接

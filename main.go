@@ -51,7 +51,6 @@ func main() {
 	log.Infof("Loaded %d endpoint(s)", len(endpoints))
 
 	for _, endpoint := range endpoints {
-		// 验证配置
 		if err := endpoint.Validate(); err != nil {
 			log.Errorf("Invalid endpoint config: %v", err)
 			os.Exit(1)

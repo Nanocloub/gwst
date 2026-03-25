@@ -61,40 +61,23 @@ func NewManager(key []byte) (*Manager, error) {
 	return m, nil
 }
 
-// generateNonce 生成安全的 nonce（计数器 + 随机数混合模式）
-// 前 8 字节：递增计数器（保证唯一性，支持 2^64 次加密）
-// 后 8 字节：随机数（防止预测和回放攻击）
-func (m *Manager) generateNonce() ([]byte, error) {
-	nonce := make([]byte, NonceSize)
-	
-	// 前 8 字节：原子递增计数器（绝对唯一）
-	count := m.counter.Add(1)
-	binary.BigEndian.PutUint64(nonce[:8], count)
-	
-	// 后 8 字节：随机数（增强安全性）
-	if _, err := io.ReadFull(rand.Reader, nonce[8:]); err != nil {
-		return nil, err
-	}
-	
-	return nonce, nil
-}
-
 // Encrypt encrypts plaintext using AEGIS-128L
 // Returns: nonce + ciphertext + tag
 func (m *Manager) Encrypt(plaintext []byte) ([]byte, error) {
-	// 生成安全的 nonce
-	nonce, err := m.generateNonce()
-	if err != nil {
+	// 使用栈变量生成 nonce，避免堆分配
+	var nonce [NonceSize]byte
+	count := m.counter.Add(1)
+	binary.BigEndian.PutUint64(nonce[:8], count)
+	if _, err := io.ReadFull(rand.Reader, nonce[8:]); err != nil {
 		return nil, err
 	}
-	
+
 	// 创建结果缓冲区，包含 nonce + ciphertext + tag
 	resultBuf := make([]byte, NonceSize, NonceSize+len(plaintext)+TagSize)
-	copy(resultBuf, nonce)
+	copy(resultBuf, nonce[:])
 
-	// 在结果缓冲区中加密（从第 NonceSize 个位置开始）
 	aead := m.aeadPool.Get().(cipher.AEAD)
-	ciphertext := aead.Seal(resultBuf, nonce, plaintext, nil)
+	ciphertext := aead.Seal(resultBuf, nonce[:], plaintext, nil)
 	m.aeadPool.Put(aead)
 
 	return ciphertext, nil
@@ -130,18 +113,20 @@ func (m *Manager) EncryptTo(dst, plaintext []byte) ([]byte, error) {
 		return nil, errors.New("destination buffer too small")
 	}
 
-	// 生成安全的 nonce
-	nonce, err := m.generateNonce()
-	if err != nil {
+	// 使用栈变量生成 nonce，避免堆分配
+	var nonce [NonceSize]byte
+	count := m.counter.Add(1)
+	binary.BigEndian.PutUint64(nonce[:8], count)
+	if _, err := io.ReadFull(rand.Reader, nonce[8:]); err != nil {
 		return nil, err
 	}
-	
+
 	// 将 nonce 复制到目标缓冲区
-	copy(dst[:NonceSize], nonce)
+	copy(dst[:NonceSize], nonce[:])
 
 	// 在目标缓冲区中加密（从第 NonceSize 个位置开始）
 	aead := m.aeadPool.Get().(cipher.AEAD)
-	ciphertext := aead.Seal(dst[:NonceSize], nonce, plaintext, nil)
+	ciphertext := aead.Seal(dst[:NonceSize], nonce[:], plaintext, nil)
 	m.aeadPool.Put(aead)
 
 	return ciphertext, nil

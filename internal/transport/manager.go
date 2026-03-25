@@ -2,6 +2,7 @@ package transport
 
 import (
 	"fmt"
+	"sync"
 )
 
 // TransportManager 传输管理器
@@ -118,6 +119,10 @@ func (f *tcpClientFactory) CreateClientTransport(cfg TransportClientConfig) (Cli
 }
 
 // QUIC 传输工厂实现
+//
+// quicClientFactory 缓存 QUICClientTransport 实例，使同一 (remoteAddr, serverName,
+// insecure) 组合的多次 Dial 共用同一持久 QUIC 连接（stream multiplexing）。
+// 无需每次建隧道都执行 TLS 握手。
 
 type quicServerFactory struct{}
 
@@ -125,13 +130,61 @@ func (f *quicServerFactory) CreateServerTransport(cfg TransportServerConfig) (Se
 	return NewQUICServerTransport(cfg)
 }
 
-type quicClientFactory struct{}
-
-func (f *quicClientFactory) CreateClientTransport(cfg TransportClientConfig) (ClientTransport, error) {
-	return NewQUICClientTransport(cfg)
+type quicClientFactory struct {
+	mu    sync.Mutex
+	cache map[string]*QUICClientTransport
 }
 
-// Global transport manager
+func (f *quicClientFactory) CreateClientTransport(cfg TransportClientConfig) (ClientTransport, error) {
+	// 缓存键：区分不同的远端地址和 TLS 参数
+	key := cfg.RemoteAddr + "|" + cfg.ServerName + "|" + fmt.Sprintf("%v", cfg.Insecure)
+
+	f.mu.Lock()
+	if f.cache == nil {
+		f.cache = make(map[string]*QUICClientTransport)
+	}
+	t, ok := f.cache[key]
+	f.mu.Unlock()
+
+	if ok {
+		t.mu.Lock()
+		alive := t.isAlive()
+		t.mu.Unlock()
+		if alive {
+			return t, nil
+		}
+	}
+
+	// 创建新 transport（可能与并发 goroutine 竞争，用二次检查解决）
+	newT, err := NewQUICClientTransport(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	// 二次检查：另一个 goroutine 可能已经创建了新的有效 transport。
+	// 注意：不使用 defer 释放锁，以便在锁外关闭失效的旧 transport（Close 含网络 I/O）。
+	f.mu.Lock()
+	var stale *QUICClientTransport
+	if existing, ok := f.cache[key]; ok {
+		existing.mu.Lock()
+		alive := existing.isAlive()
+		existing.mu.Unlock()
+		if alive {
+			f.mu.Unlock()
+			return existing, nil
+		}
+		stale = existing
+	}
+	f.cache[key] = newT
+	f.mu.Unlock()
+
+	// 在锁外关闭失效的旧 transport，避免 QUIC 连接资源（socket、goroutine）泄漏。
+	if stale != nil {
+		stale.Close()
+	}
+	return newT, nil
+}
+
 var globalTransportManager = NewTransportManager()
 
 // GetTransportManager 获取全局传输管理器

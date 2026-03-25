@@ -14,19 +14,16 @@ const (
 	DefaultWriteTimeout = 15 * time.Second
 	// DefaultBufferSize 默认缓冲区大小 16KB
 	DefaultBufferSize = 16 * 1024
-	// MaxUDPSize UDP 最大数据包大小
-	MaxUDPSize = 65535
+	MaxUDPSize        = 65535
 	// UDPBufferSize 包含加密开销的 UDP 缓冲区大小 (65535 + 32 + 2)
 	UDPBufferSize = MaxUDPSize + 64
 )
 
-// DeadlineWriter 接口用于支持写入期限的 io.Writer
 type DeadlineWriter interface {
 	Write([]byte) (int, error)
 	SetWriteDeadline(time.Time) error
 }
 
-// CryptoManager 定义加密/解密操作接口
 type CryptoManager interface {
 	Encrypt(plaintext []byte) ([]byte, error)
 	Decrypt(ciphertext []byte) ([]byte, error)
@@ -79,7 +76,11 @@ func PutBuffer(pool *sync.Pool, buffer *[]byte) {
 	}
 }
 
-// CopyBufferWithWriteTimeout copies data from src to dst with write timeout
+// CopyBufferWithWriteTimeout copies data from src to dst with write timeout.
+//
+// 性能优化：SetWriteDeadline 是一次系统调用（setsockopt），若每次写操作前都调用
+// 会产生大量额外 syscall。改为懒惰刷新策略：仅当距上次设置超过 deadline / 4
+// 时才重新设置，在保证超时语义的同时大幅减少 syscall 数量。
 func CopyBufferWithWriteTimeout(
 	dst DeadlineWriter,
 	src io.Reader,
@@ -90,12 +91,22 @@ func CopyBufferWithWriteTimeout(
 		timeout = DefaultWriteTimeout
 	}
 
+	// refreshInterval：每隔 timeout/4 刷新一次 deadline，而不是每次 Write 都刷新。
+	// 这样最坏情况下仍在 timeout 内超时（上次刷新后最多再过 timeout 才超时），
+	// 而 syscall 数量减少到原来的 1/(chunks_per_interval)。
+	refreshInterval := timeout / 4
+	var deadlineSetAt time.Time
+
 	for {
 		nr, er := src.Read(buf)
 		if nr > 0 {
-			err = dst.SetWriteDeadline(time.Now().Add(timeout))
-			if err != nil {
-				break
+			now := time.Now()
+			if deadlineSetAt.IsZero() || now.Sub(deadlineSetAt) >= refreshInterval {
+				err = dst.SetWriteDeadline(now.Add(timeout))
+				if err != nil {
+					break
+				}
+				deadlineSetAt = now
 			}
 
 			nw, ew := dst.Write(buf[0:nr])

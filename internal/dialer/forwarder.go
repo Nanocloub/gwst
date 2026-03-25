@@ -26,7 +26,6 @@ const (
 	DefaultUDPMaxEarlyDataSize    = 4 * 1024
 )
 
-// 导出接口别名
 type Logger = utils.Logger
 type CryptoManager = utils.CryptoManager
 type deadlineWriter = utils.DeadlineWriter
@@ -48,22 +47,19 @@ var sharedUDPConnInfoPool = sync.Pool{
 
 func getUDPConnInfo() *udpConnInfo {
 	u := sharedUDPConnInfoPool.Get().(*udpConnInfo)
-	// Reset state for reuse
 	u.Conn = nil
 	u.dialErr = nil
-	u.remoteAddr = nil
 	u.setUpDone = make(chan struct{})
 	u.setUpDoneOnce = sync.Once{}
 	u.closed.Store(false)
 	u.forwarder = nil
-	u.framingCached.Store(false)
+	// 重置为当前时间，防止复用对象被清理 goroutine 立即当作过期连接驱逐
+	u.lastActive.Store(time.Now().UnixNano())
 	return u
 }
 
 func putUDPConnInfo(u *udpConnInfo) {
-	// Clear references to help GC
 	u.Conn = nil
-	u.remoteAddr = nil
 	u.forwarder = nil
 	sharedUDPConnInfoPool.Put(u)
 }
@@ -71,15 +67,12 @@ func putUDPConnInfo(u *udpConnInfo) {
 type udpConnInfo struct {
 	net.Conn
 	dialErr       error
-	remoteAddr    net.Addr // Store remote address instead of dialer
 	setUpDone     chan struct{}
 	lastActive    atomic.Int64
 	setUpDoneOnce sync.Once
 	dialLock      sync.Mutex
-	closed        atomic.Bool // Use atomic for thread-safe access
+	closed        atomic.Bool
 	forwarder     *Forwarder
-	needsFraming  bool        // 缓存是否需要帧封装的判断结果
-	framingCached atomic.Bool // 标记是否已缓存
 }
 
 func (u *udpConnInfo) Close() error {
@@ -121,7 +114,6 @@ func (u *udpConnInfo) Setup() (net.Conn, error) {
 		return u.Conn, nil
 	}
 
-	// Create a stub dial - actual implementation would be in wsc.go
 	if u.forwarder != nil && u.forwarder.wsDialer != nil {
 		conn, err := u.forwarder.wsDialer.DialUDP()
 		if err != nil {
@@ -132,10 +124,8 @@ func (u *udpConnInfo) Setup() (net.Conn, error) {
 		// 检查是否已经是 CryptoConn（由 compat/dialer.go 包装）
 		// 如果是，则不再重复包装，避免双重封装导致协议不匹配
 		if _, ok := u.Conn.(*utils.CryptoConn); !ok {
-			u.needsFraming = isStreamConn(u.Conn)
-			u.Conn = utils.NewCryptoConn(u.Conn, u.forwarder.cryptoManager, u.needsFraming)
+			u.Conn = utils.NewCryptoConn(u.Conn, u.forwarder.cryptoManager, isStreamConn(u.Conn))
 		}
-		u.framingCached.Store(true)
 		return u.Conn, nil
 	}
 	u.dialErr = errors.New("no forwarder configured")
@@ -164,9 +154,7 @@ func (u *udpConnInfo) SetupWithEarlyData(
 		return u.Conn, nil
 	}
 
-	// Create a stub dial - actual implementation would be in wsc.go
 	if u.forwarder != nil && u.forwarder.wsDialer != nil {
-		// Encrypt early data if encryption is enabled
 		dataToEncode := earlyData
 		if u.forwarder.cryptoManager != nil {
 			encrypted, err := u.forwarder.cryptoManager.Encrypt(dataToEncode)
@@ -189,10 +177,8 @@ func (u *udpConnInfo) SetupWithEarlyData(
 		// 检查是否已经是 CryptoConn（由 compat/dialer.go 包装）
 		// 如果是，则不再重复包装，避免双重封装导致协议不匹配
 		if _, ok := u.Conn.(*utils.CryptoConn); !ok {
-			u.needsFraming = isStreamConn(u.Conn)
-			u.Conn = utils.NewCryptoConn(u.Conn, u.forwarder.cryptoManager, u.needsFraming)
+			u.Conn = utils.NewCryptoConn(u.Conn, u.forwarder.cryptoManager, isStreamConn(u.Conn))
 		}
-		u.framingCached.Store(true)
 		return u.Conn, nil
 	}
 
@@ -248,7 +234,6 @@ func (u *udpConnInfo) Write(b []byte) (int, error) {
 		return 0, err
 	}
 
-	// 已经统一使用 utils.CryptoConn 处理加密和帧封装
 	n, err := conn.Write(b)
 
 	if err != nil {
@@ -277,7 +262,8 @@ type Forwarder struct {
 	udpConn                *net.UDPConn
 	onListened             chan struct{}
 	shutdowned             chan struct{}
-	bufferPool             *sync.Pool
+	bufferPool             *sync.Pool // 65KB pool，供 UDP 路径使用
+	tcpCopyPool            *sync.Pool // 16KB pool，供 TCP 双向复制使用
 	cryptoManager          CryptoManager
 	udpEarlyDataHeaderName string
 	listenAddr             string
@@ -417,14 +403,12 @@ func NewForwarder(listenAddr string, wsDialer WebSocketDialer, opts ...Forwarder
 		wf.bufferSize = utils.DefaultBufferSize
 	}
 
-	// Ensure buffer is large enough for encrypted packets if encryption is enabled
-	// Although here we don't know if encryption is enabled until run-time maybe?
-	// But actually we are setting wf.bufferSize.
 	if wf.bufferSize < utils.UDPBufferSize {
 		wf.bufferSize = utils.UDPBufferSize
 	}
 
 	wf.bufferPool = utils.NewBufferPool(wf.bufferSize)
+	wf.tcpCopyPool = utils.NewBufferPool(utils.DefaultBufferSize)
 
 	wf.log = utils.NewSafeLoggerOrNull(wf.log)
 
@@ -671,53 +655,39 @@ func (wf *Forwarder) handleTCP(conn net.Conn) {
 	}
 	defer wsConn.Close()
 
-	// Check if wsConn supports deadline interface
-	wsConnWithDeadline, ok := wsConn.(deadlineWriter)
-	if !ok {
-		// If not, we skip deadline operations but still copy data
-		wf.log.Warnf("Tunnel connection doesn't support deadlines, proceeding without them")
-	}
+	// DialTCP 返回的连接包装为 CryptoConn，CryptoConn 通过编译期断言保证实现了 DeadlineWriter。
+	// 此遍断言必然成功；若失败说明调用方返回了不符合合同的对象，当 panic 处理。
+	wsConnDW := wsConn.(deadlineWriter)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		buffer := utils.GetBuffer(wf.bufferPool)
-		defer utils.PutBuffer(wf.bufferPool, buffer)
-		defer conn.Close()
-		defer wsConn.Close()
+		buffer := utils.GetBuffer(wf.tcpCopyPool)
+		defer utils.PutBuffer(wf.tcpCopyPool, buffer)
 
-		if wsConnWithDeadline != nil {
-			_, err := utils.CopyBufferWithWriteTimeout(wsConnWithDeadline, conn, *buffer, utils.DefaultWriteTimeout)
-			if err != nil && !errors.Is(err, net.ErrClosed) {
-				wf.log.Warnf("Failed to copy data to tunnel: %v", err)
-			}
-		} else {
-			// Fall back to simple copy
-			_, err := io.Copy(wsConn, conn)
-			if err != nil && !errors.Is(err, net.ErrClosed) {
-				wf.log.Warnf("Failed to copy data to tunnel: %v", err)
-			}
+		// Direction: local client -> tunnel (conn 是源，wsConnDW 是目标)
+		// 使用写超时：若隆道停止读取，写入会在 DefaultWriteTimeout 后超时退出，避免 goroutine 永久阻塞。
+		if _, err := utils.CopyBufferWithWriteTimeout(wsConnDW, conn, *buffer, utils.DefaultWriteTimeout); err != nil &&
+			!errors.Is(err, net.ErrClosed) {
+			wf.log.Warnf("Failed to copy data to tunnel: %v", err)
 		}
 	}()
 
-	buffer := utils.GetBuffer(wf.bufferPool)
-	defer utils.PutBuffer(wf.bufferPool, buffer)
+	buffer := utils.GetBuffer(wf.tcpCopyPool)
+	defer utils.PutBuffer(wf.tcpCopyPool, buffer)
 
-	if wsConnWithDeadline != nil {
-		_, err = utils.CopyBufferWithWriteTimeout(conn, wsConn, *buffer, utils.DefaultWriteTimeout)
-		if err != nil && !errors.Is(err, net.ErrClosed) {
-			wf.log.Warnf("Failed to copy data to Target: %v", err)
-		}
-	} else {
-		// Fall back to simple copy
-		_, err = io.Copy(conn, wsConn)
-		if err != nil && !errors.Is(err, net.ErrClosed) {
-			wf.log.Warnf("Failed to copy data to Target: %v", err)
-		}
+	// Direction: tunnel -> local client (wsConn 是源，conn 是目标)
+	// 使用写超时：若客户端停止读取，写入会在 DefaultWriteTimeout 后超时退出。
+	if _, err = utils.CopyBufferWithWriteTimeout(conn, wsConn, *buffer, utils.DefaultWriteTimeout); err != nil &&
+		!errors.Is(err, net.ErrClosed) {
+		wf.log.Warnf("Failed to copy data to Target: %v", err)
 	}
 
-	// Wait for the copy goroutine to finish
+	// 主方向结束后主动关闭双端，让 goroutine 立即退出，避免半关闭状态积压。
+	conn.Close()
+	wsConn.Close()
+
 	wg.Wait()
 }
 
@@ -747,7 +717,8 @@ func (wf *Forwarder) processUDP() error {
 					_, err := value.SetupWithEarlyData(dataCopy, DefaultUDPEarlyDataHeaderName)
 					if err != nil {
 						wf.log.Errorf("Failed to setup UDP connection with early data: %v", err)
-						wf.udpConns.Delete(key)
+						wf.udpConns.CompareAndDelete(key, value)
+						putUDPConnInfo(value)
 						return
 					}
 					go wf.handleUDPResponse(value, remoteAddr)
@@ -757,18 +728,18 @@ func (wf *Forwarder) processUDP() error {
 				if _, err := value.SetupWithEarlyData((*buffer)[:n], wf.udpEarlyDataHeaderName); err != nil {
 					wf.log.Errorf("Failed to setup new UDP in websocket connection: %v", err)
 					wf.udpConns.CompareAndDelete(key, value)
+					putUDPConnInfo(value)
 					return
 				}
 
 				go wf.handleUDPResponse(value, remoteAddr)
-
-				// Early data already sent, no need to write again
 				return
 			}
 
 			if _, err := value.Setup(); err != nil {
 				wf.log.Errorf("Failed to setup new UDP in websocket connection: %v", err)
 				wf.udpConns.CompareAndDelete(key, value)
+				putUDPConnInfo(value)
 				return
 			}
 
@@ -777,7 +748,6 @@ func (wf *Forwarder) processUDP() error {
 			connInfo.forwarder = nil
 			putUDPConnInfo(connInfo)
 
-			// Wait for setup to complete and check for errors
 			<-value.setUpDone
 			if value.dialErr != nil {
 				wf.log.Errorf("UDP connection has setup error: %v", value.dialErr)
@@ -786,7 +756,6 @@ func (wf *Forwarder) processUDP() error {
 			}
 		}
 
-		// Write data (CryptoConn will handle encryption internally if configured)
 		dataToWrite := (*buffer)[:n]
 		_, err := value.Write(dataToWrite)
 		if err != nil {
@@ -825,7 +794,6 @@ func (wf *Forwarder) handleUDPResponse(value *udpConnInfo, remoteAddr *net.UDPAd
 	buffer := *bufferP
 
 	for {
-		// CryptoConn 已经统一处理了帧解封装和解密
 		n, err := value.Read(buffer)
 
 		if err != nil {
@@ -844,7 +812,6 @@ func (wf *Forwarder) handleUDPResponse(value *udpConnInfo, remoteAddr *net.UDPAd
 			continue
 		}
 
-		// 写入本地 UDP 端口
 		err = wf.udpConn.SetWriteDeadline(time.Now().Add(utils.DefaultWriteTimeout))
 		if err != nil {
 			wf.log.Errorf("Failed to set write deadline: %v", err)
@@ -864,7 +831,6 @@ func (wf *Forwarder) handleUDPResponse(value *udpConnInfo, remoteAddr *net.UDPAd
 	}
 }
 
-// isStreamConn 检查连接是否是流式连接（TCP/QUIC），而不是 WebSocket
 func isStreamConn(conn net.Conn) bool {
 	return utils.IsStreamConn(conn)
 }

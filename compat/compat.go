@@ -39,6 +39,7 @@ var (
 	WithHandlerBufferSize             = tunnel.WithHandlerBufferSize
 	WithHandlerLoadBalance            = tunnel.WithHandlerLoadBalance
 	WithHandlerUDPDialReadTimeout     = tunnel.WithHandlerUDPDialReadTimeout
+	WithHandlerUDPIdleTimeout         = tunnel.WithHandlerUDPIdleTimeout
 	WithHandlerDisableTCPProtocol     = tunnel.WithHandlerDisableTCPProtocol
 	WithHandlerDisableUDPProtocol     = tunnel.WithHandlerDisableUDPProtocol
 	WithHandlerUDPEarlyDataHeaderName = tunnel.WithHandlerUDPEarlyDataHeaderName
@@ -141,7 +142,7 @@ func NewServer(path string, wsHandler *Handler, opts ...ServerOption) *Server {
 		path:       path,
 		onListened: make(chan struct{}),
 		shutdowned: make(chan struct{}),
-		transport:  "websocket", // 默认使用 websocket
+		transport:  "websocket",
 	}
 
 	for _, opt := range opts {
@@ -167,12 +168,10 @@ func (ps *Server) WaitShutdown() {
 }
 
 func (ps *Server) Serve() error {
-	// 对于 TCP 和 QUIC 传输，使用 transport 包
 	if ps.transport == "tcp" || ps.transport == "quic" {
 		return ps.serveWithTransport()
 	}
 
-	// 对于 WebSocket，使用原来的实现
 	server := ps.Server()
 
 	defer ps.closeWaitListen()
@@ -267,12 +266,12 @@ func (ps *Server) Server() *http.Server {
 func (ps *Server) Close() error {
 	defer ps.closeWaitListen()
 
-	// 根据传输类型关闭相应的服务器
 	if ps.serverTransport != nil {
 		return ps.serverTransport.Close()
 	}
 
 	if ps.server != nil {
+		ps.wsHandler.Close()
 		return ps.server.Close()
 	}
 
@@ -283,12 +282,10 @@ func (ps *Server) Shutdown(ctx context.Context) error {
 	defer ps.closeWaitListen()
 	defer ps.wsHandler.Wait()
 
-	// TCP/QUIC 没有优雅关闭，直接 Close
 	if ps.serverTransport != nil {
 		return ps.serverTransport.Close()
 	}
 
-	// WebSocket 支持优雅关闭
 	if ps.server != nil {
 		return ps.server.Shutdown(ctx)
 	}
@@ -354,12 +351,16 @@ func (ps *Server) createTransportHandler() func(net.Conn) error {
 	return func(conn net.Conn) error {
 		defer conn.Close()
 
-		// 从连接中读取协议标识字节
+		// 从连接中读取协议标识字节（5 秒超时，防止半开连接长期占用 goroutine）
 		// 0x01 = TCP, 0x02 = UDP
-		protocolByte := make([]byte, 1)
-		if _, err := conn.Read(protocolByte); err != nil {
+		if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			return fmt.Errorf("failed to set protocol byte deadline: %w", err)
+		}
+		var protocolByte [1]byte
+		if _, err := conn.Read(protocolByte[:]); err != nil {
 			return fmt.Errorf("failed to read protocol byte: %w", err)
 		}
+		conn.SetReadDeadline(time.Time{})
 
 		protocol := "tcp"
 		if protocolByte[0] == 0x02 {
