@@ -9,7 +9,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/quic-go/quic-go"
+	"github.com/apernet/quic-go"
+	"github.com/apernet/quic-go/congestion"
+
+	"github.com/zijiren233/gwst/internal/congestion/bbr"
 )
 
 // QUICServerTransport QUIC 服务端传输实现
@@ -27,6 +30,13 @@ type QUICServerTransport struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 }
+
+// quicInitialPacketSize is the initial UDP packet size used for both quic.Config
+// and BBR congestion control initialization, ensuring they are consistent.
+// quic-go's SetCongestionControl does NOT propagate the current datagram size
+// to the replacement CC, so BBR must be initialized with the same value as
+// quic.Config.InitialPacketSize to avoid pacing budget mismatches.
+const quicInitialPacketSize uint16 = 1452
 
 // NewQUICServerTransport 创建 QUIC 服务端传输
 func NewQUICServerTransport(cfg TransportServerConfig) (*QUICServerTransport, error) {
@@ -88,7 +98,7 @@ func (qst *QUICServerTransport) Serve() error {
 	listener, err := quic.ListenAddr(qst.config.ListenAddr, tlsConfig, &quic.Config{
 		MaxIdleTimeout:                 2 * time.Minute,
 		KeepAlivePeriod:                30 * time.Second,
-		InitialPacketSize:              1452, // 直接使用 quic-go 允许的最大包大小，跳过 PMTU 热身
+		InitialPacketSize:              quicInitialPacketSize, // 直接使用最大允许包大小，跳过 PMTU 热身
 		InitialStreamReceiveWindow:     qst.config.QUICInitialStreamReceiveWindow,
 		MaxStreamReceiveWindow:         qst.config.QUICMaxStreamReceiveWindow,
 		InitialConnectionReceiveWindow: qst.config.QUICInitialConnReceiveWindow,
@@ -118,13 +128,14 @@ func (qst *QUICServerTransport) Serve() error {
 			continue
 		}
 
+		setBBR(conn)
 		qst.connectionWg.Add(1)
 		go qst.handleConnection(conn)
 	}
 }
 
 // handleConnection 处理单个 QUIC 连接
-func (qst *QUICServerTransport) handleConnection(conn quic.Connection) {
+func (qst *QUICServerTransport) handleConnection(conn *quic.Conn) {
 	// defer 顺序（LIFO）：
 	//   3. connectionWg.Done()      — 最后执行，通知 Close() 本连接已完全清理
 	//   2. streamWg.Wait()          — 等待所有流 goroutine 退出
@@ -141,10 +152,10 @@ func (qst *QUICServerTransport) handleConnection(conn quic.Connection) {
 		}
 
 		streamWg.Add(1)
-		go func(s quic.Stream) {
+		go func(s *quic.Stream) {
 			defer streamWg.Done()
 			defer s.Close()
-			if err := qst.config.Handler(&quicStreamWrapper{Stream: s}); err != nil {
+			if err := qst.config.Handler(&quicStreamWrapper{Stream: s, conn: conn}); err != nil {
 				qst.config.Logger.Infof("Stream handler error: %v", err)
 			}
 		}(stream)
@@ -205,7 +216,7 @@ type QUICClientTransport struct {
 	config      TransportClientConfig
 	mu          sync.Mutex      // 保护 conn 和 closed 字段；持有时间短
 	reconnectMu sync.Mutex      // 序列化重连操作（持有期间可能阻塞 dialNewConn）
-	conn        quic.Connection // 持久复用的 QUIC 连接；nil 表示尚未建立或已失效
+	conn        *quic.Conn // 持久复用的 QUIC 连接；nil 表示尚未建立或已失效
 	tlsCfg      *tls.Config     // 预构建，不可变，避免每次 Dial 重复分配
 	quicCfg     *quic.Config    // 预构建，不可变
 	closed      bool
@@ -238,7 +249,7 @@ func NewQUICClientTransport(cfg TransportClientConfig) (*QUICClientTransport, er
 		// 直接使用 quic-go 允许的最大包大小（1452 字节），跳过从 1280 开始的
 		// PMTU 探测热身阶段。对于本地/局域网场景（loopback MTU=65535）可立即
 		// 使用最大包，减少同等数据量所需的 UDP 数据包数。
-		InitialPacketSize:              1452,
+		InitialPacketSize:              quicInitialPacketSize,
 		InitialStreamReceiveWindow:     cfg.QUICInitialStreamReceiveWindow,
 		MaxStreamReceiveWindow:         cfg.QUICMaxStreamReceiveWindow,
 		InitialConnectionReceiveWindow: cfg.QUICInitialConnReceiveWindow,
@@ -258,8 +269,19 @@ func (qct *QUICClientTransport) isAlive() bool {
 	return !qct.closed && (qct.conn == nil || qct.conn.Context().Err() == nil)
 }
 
+// setBBR sets BBR congestion control on a QUIC connection.
+// The initialMaxDatagramSize must match quicInitialPacketSize used in quic.Config,
+// because quic-go's SetCongestionControl does not propagate the current datagram
+// size to the newly installed CC.
+func setBBR(conn *quic.Conn) {
+	conn.SetCongestionControl(bbr.NewBbrSender(
+		bbr.DefaultClock{},
+		congestion.ByteCount(quicInitialPacketSize),
+	))
+}
+
 // dialNewConn 建立全新的 QUIC 连接。只读取不可变字段（config/tlsCfg/quicCfg），无需持锁。
-func (qct *QUICClientTransport) dialNewConn(ctx context.Context) (quic.Connection, error) {
+func (qct *QUICClientTransport) dialNewConn(ctx context.Context) (*quic.Conn, error) {
 	if qct.config.ListenConfig != nil {
 		pconn, err := qct.config.ListenConfig.ListenPacket(ctx, "udp", "")
 		if err != nil {
@@ -276,9 +298,15 @@ func (qct *QUICClientTransport) dialNewConn(ctx context.Context) (quic.Connectio
 			pconn.Close()
 			return nil, err
 		}
+		setBBR(conn)
 		return conn, nil
 	}
-	return quic.DialAddr(ctx, qct.config.RemoteAddr, qct.tlsCfg, qct.quicCfg)
+	conn, err := quic.DialAddr(ctx, qct.config.RemoteAddr, qct.tlsCfg, qct.quicCfg)
+	if err != nil {
+		return nil, err
+	}
+	setBBR(conn)
+	return conn, nil
 }
 
 // Dial 在持久 QUIC 连接上开一个新流。首次调用建立连接；后续调用复用连接，
@@ -360,6 +388,13 @@ func (qct *QUICClientTransport) Dial(ctx context.Context) (net.Conn, error) {
 	}
 
 	qct.mu.Lock()
+	if qct.closed {
+		qct.mu.Unlock()
+		stream.CancelRead(0)
+		stream.Close()
+		newConn.CloseWithError(0, "transport closed")
+		return nil, net.ErrClosed
+	}
 	qct.conn = newConn
 	qct.mu.Unlock()
 	return &quicStreamConn{stream: stream, conn: newConn}, nil
@@ -385,7 +420,8 @@ func (qct *QUICClientTransport) Close() error {
 
 // quicStreamWrapper wraps a QUIC stream to implement net.Conn
 type quicStreamWrapper struct {
-	Stream quic.Stream
+	Stream *quic.Stream
+	conn   *quic.Conn
 }
 
 func (q *quicStreamWrapper) Read(b []byte) (int, error) {
@@ -405,13 +441,11 @@ func (q *quicStreamWrapper) Close() error {
 }
 
 func (q *quicStreamWrapper) LocalAddr() net.Addr {
-	// QUIC streams don't have direct addresses, return nil
-	return nil
+	return q.conn.LocalAddr()
 }
 
 func (q *quicStreamWrapper) RemoteAddr() net.Addr {
-	// QUIC streams don't have direct addresses, return nil
-	return nil
+	return q.conn.RemoteAddr()
 }
 
 func (q *quicStreamWrapper) SetDeadline(t time.Time) error {
@@ -428,8 +462,8 @@ func (q *quicStreamWrapper) SetWriteDeadline(t time.Time) error {
 
 // quicStreamConn wraps a QUIC stream to implement net.Conn for client
 type quicStreamConn struct {
-	stream quic.Stream
-	conn   quic.Connection
+	stream *quic.Stream
+	conn   *quic.Conn
 }
 
 func (qc *quicStreamConn) Read(b []byte) (int, error) {
