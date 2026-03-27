@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/zijiren233/gwst/internal/config"
 	"github.com/zijiren233/gwst/internal/utils"
@@ -125,6 +126,12 @@ type TransportServerConfig struct {
 	QUICMaxStreamReceiveWindow     uint64
 	QUICInitialConnReceiveWindow   uint64
 	QUICMaxConnReceiveWindow       uint64
+	// QUIC 连接最大空闲超时，0 表示使用默认值（2分钟）
+	QUICMaxIdleTimeout time.Duration
+	// QUIC 允许对端打开的最大双向流数，0 表示使用 quic-go 默认值（100）
+	QUICMaxIncomingStreams int64
+	// 是否禁用 QUIC 路径 MTU 探测
+	QUICDisablePathMTUDiscovery bool
 }
 
 // TransportClientConfig 客户端传输配置
@@ -181,6 +188,10 @@ type TransportClientConfig struct {
 	QUICMaxStreamReceiveWindow     uint64
 	QUICInitialConnReceiveWindow   uint64
 	QUICMaxConnReceiveWindow       uint64
+	// QUIC 连接最大空闲超时，0 表示使用默认值（2分钟）
+	QUICMaxIdleTimeout time.Duration
+	// 是否禁用 QUIC 路径 MTU 探测
+	QUICDisablePathMTUDiscovery bool
 }
 
 // LoadCACertPool 从 PEM 文件加载 CA 证书池，用于 TLS 客户端固定信任指定证书。

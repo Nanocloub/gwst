@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -102,6 +103,12 @@ type Endpoint struct {
 	QUICInitialConnReceiveWindow uint64 `yaml:"quic_initial_conn_receive_window"`
 	// QUIC 连接最大接收窗口大小（字节），0 表示使用 quic-go 默认值（15MB）
 	QUICMaxConnReceiveWindow uint64 `yaml:"quic_max_conn_receive_window"`
+	// QUIC 连接最大空闲超时，0 表示使用默认值（2分钟）
+	QUICMaxIdleTimeout time.Duration `yaml:"quic_max_idle_timeout"`
+	// QUIC 服务端允许对端打开的最大双向流数，0 表示使用 quic-go 默认值（100），仅服务端有效
+	QUICMaxIncomingStreams int64 `yaml:"quic_max_incoming_streams"`
+	// 是否禁用 QUIC 路径 MTU 探测（RFC 8899），默认 false
+	QUICDisablePathMTUDiscovery bool `yaml:"quic_disable_path_mtu_discovery"`
 }
 
 // Endpoints 表示配置文件中的所有端点

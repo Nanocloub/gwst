@@ -22,7 +22,8 @@
   key: "123456"
   tls: true
   server_name: "www.microsoft.com"
-  insecure: true
+  insecure: true       # 跳过证书验证（不推荐生产环境）
+  # ca_cert_file: "server.crt"  # 替代 insecure: true；指定服务端自签证书或 CA，更安全
 
 # Another server configuration (without TLS)
 - is_client: false

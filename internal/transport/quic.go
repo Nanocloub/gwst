@@ -95,14 +95,20 @@ func (qst *QUICServerTransport) Serve() error {
 	}
 
 	// Create QUIC listener
+	maxIdleTimeout := 2 * time.Minute
+	if qst.config.QUICMaxIdleTimeout > 0 {
+		maxIdleTimeout = qst.config.QUICMaxIdleTimeout
+	}
 	listener, err := quic.ListenAddr(qst.config.ListenAddr, tlsConfig, &quic.Config{
-		MaxIdleTimeout:                 2 * time.Minute,
+		MaxIdleTimeout:                 maxIdleTimeout,
 		KeepAlivePeriod:                30 * time.Second,
 		InitialPacketSize:              quicInitialPacketSize, // 直接使用最大允许包大小，跳过 PMTU 热身
 		InitialStreamReceiveWindow:     qst.config.QUICInitialStreamReceiveWindow,
 		MaxStreamReceiveWindow:         qst.config.QUICMaxStreamReceiveWindow,
 		InitialConnectionReceiveWindow: qst.config.QUICInitialConnReceiveWindow,
 		MaxConnectionReceiveWindow:     qst.config.QUICMaxConnReceiveWindow,
+		MaxIncomingStreams:             qst.config.QUICMaxIncomingStreams,
+		DisablePathMTUDiscovery:        qst.config.QUICDisablePathMTUDiscovery,
 	})
 	if err != nil {
 		qst.listenErr = err
@@ -253,8 +259,12 @@ func NewQUICClientTransport(cfg TransportClientConfig) (*QUICClientTransport, er
 		tlsCfg.RootCAs = pool
 	}
 
+	maxIdleTimeout := 2 * time.Minute
+	if cfg.QUICMaxIdleTimeout > 0 {
+		maxIdleTimeout = cfg.QUICMaxIdleTimeout
+	}
 	quicCfg := &quic.Config{
-		MaxIdleTimeout:  2 * time.Minute,
+		MaxIdleTimeout:  maxIdleTimeout,
 		KeepAlivePeriod: 30 * time.Second,
 		// 直接使用 quic-go 允许的最大包大小（1452 字节），跳过从 1280 开始的
 		// PMTU 探测热身阶段。对于本地/局域网场景（loopback MTU=65535）可立即
@@ -264,6 +274,7 @@ func NewQUICClientTransport(cfg TransportClientConfig) (*QUICClientTransport, er
 		MaxStreamReceiveWindow:         cfg.QUICMaxStreamReceiveWindow,
 		InitialConnectionReceiveWindow: cfg.QUICInitialConnReceiveWindow,
 		MaxConnectionReceiveWindow:     cfg.QUICMaxConnReceiveWindow,
+		DisablePathMTUDiscovery:        cfg.QUICDisablePathMTUDiscovery,
 	}
 
 	return &QUICClientTransport{

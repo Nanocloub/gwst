@@ -69,27 +69,31 @@ var (
 var balanceTargets = BalanceTargets
 
 type Server struct {
-	listener              net.Listener
-	listenErr             error
-	shutdowned            chan struct{}
-	onListened            chan struct{}
-	server                *http.Server              // for WebSocket
-	serverTransport       transport.ServerTransport // for TCP/QUIC
-	wsHandler             *Handler
-	tlsConfig             *tls.Config
-	path                  string
-	certFile              string
-	keyFile               string
-	serverName            string
-	listenAddr            string
-	waitListenCloseOnce   sync.Once
-	tls                   bool
-	transport             string // "websocket", "tcp", or "quic"
+	listener            net.Listener
+	listenErr           error
+	shutdowned          chan struct{}
+	onListened          chan struct{}
+	server              *http.Server              // for WebSocket
+	serverTransport     transport.ServerTransport // for TCP/QUIC
+	wsHandler           *Handler
+	tlsConfig           *tls.Config
+	path                string
+	certFile            string
+	keyFile             string
+	serverName          string
+	listenAddr          string
+	waitListenCloseOnce sync.Once
+	tls                 bool
+	transport           string // "websocket", "tcp", or "quic"
 	// QUIC 接收窗口大小（字节），0 表示使用 quic-go 默认值
 	quicInitialStreamRecvWindow uint64
 	quicMaxStreamRecvWindow     uint64
 	quicInitialConnRecvWindow   uint64
 	quicMaxConnRecvWindow       uint64
+	// QUIC 额外配置
+	quicMaxIdleTimeout          time.Duration
+	quicMaxIncomingStreams      int64
+	quicDisablePathMTUDiscovery bool
 }
 
 type ServerOption func(*Server)
@@ -144,6 +148,27 @@ func WithQUICWindowSizes(initialStream, maxStream, initialConn, maxConn uint64) 
 		ps.quicMaxStreamRecvWindow = maxStream
 		ps.quicInitialConnRecvWindow = initialConn
 		ps.quicMaxConnRecvWindow = maxConn
+	}
+}
+
+// WithQUICMaxIdleTimeout 设置 QUIC 连接最大空闲超时。0 表示使用默认值（2分钟）。
+func WithQUICMaxIdleTimeout(d time.Duration) ServerOption {
+	return func(ps *Server) {
+		ps.quicMaxIdleTimeout = d
+	}
+}
+
+// WithQUICMaxIncomingStreams 设置 QUIC 服务端允许对端打开的最大双向流数。0 表示使用默认值（100）。
+func WithQUICMaxIncomingStreams(n int64) ServerOption {
+	return func(ps *Server) {
+		ps.quicMaxIncomingStreams = n
+	}
+}
+
+// WithQUICDisablePathMTUDiscovery 设置是否禁用 QUIC 路径 MTU 探测。
+func WithQUICDisablePathMTUDiscovery(v bool) ServerOption {
+	return func(ps *Server) {
+		ps.quicDisablePathMTUDiscovery = v
 	}
 }
 
@@ -327,6 +352,9 @@ func (ps *Server) serveWithTransport() error {
 		QUICMaxStreamReceiveWindow:     ps.quicMaxStreamRecvWindow,
 		QUICInitialConnReceiveWindow:   ps.quicInitialConnRecvWindow,
 		QUICMaxConnReceiveWindow:       ps.quicMaxConnRecvWindow,
+		QUICMaxIdleTimeout:             ps.quicMaxIdleTimeout,
+		QUICMaxIncomingStreams:         ps.quicMaxIncomingStreams,
+		QUICDisablePathMTUDiscovery:    ps.quicDisablePathMTUDiscovery,
 	}
 
 	// 创建传输管理器

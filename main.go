@@ -219,6 +219,15 @@ func newServer(endpoint config.Endpoint) *compat.Server {
 			endpoint.QUICMaxConnReceiveWindow,
 		))
 	}
+	if endpoint.QUICMaxIdleTimeout != 0 {
+		opts = append(opts, compat.WithQUICMaxIdleTimeout(endpoint.QUICMaxIdleTimeout))
+	}
+	if endpoint.QUICMaxIncomingStreams != 0 {
+		opts = append(opts, compat.WithQUICMaxIncomingStreams(endpoint.QUICMaxIncomingStreams))
+	}
+	if endpoint.QUICDisablePathMTUDiscovery {
+		opts = append(opts, compat.WithQUICDisablePathMTUDiscovery(true))
+	}
 
 	return compat.NewServer(endpoint.Path, handler, opts...)
 }
@@ -249,6 +258,12 @@ func newClient(endpoint config.Endpoint) *compat.Forwarder {
 			endpoint.QUICInitialConnReceiveWindow,
 			endpoint.QUICMaxConnReceiveWindow,
 		))
+	}
+	if endpoint.QUICMaxIdleTimeout != 0 {
+		opts = append(opts, compat.WithDialQUICMaxIdleTimeout(endpoint.QUICMaxIdleTimeout))
+	}
+	if endpoint.QUICDisablePathMTUDiscovery {
+		opts = append(opts, compat.WithDialQUICDisablePathMTUDiscovery(true))
 	}
 
 	forwarderOpts := []compat.ForwarderOption{

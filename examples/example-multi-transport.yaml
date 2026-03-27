@@ -35,7 +35,8 @@
   encryption_key: "1234567890123456" # 必须与服务端相同
   tls: true
   server_name: "example.com"
-  insecure: true
+  insecure: true                     # 跳过证书验证（不推荐生产环境）
+  # ca_cert_file: "cert.pem"         # 替代 insecure: true；指定服务端自签证书或签发它的 CA（PEM），更安全
 
 
 # ─────────────────────────────────────────────
@@ -84,7 +85,8 @@
   encryption_key: "1234567890123456"
   tls: true
   server_name: "example.com"
-  insecure: true
+  insecure: true                     # 跳过证书验证（不推荐生产环境）
+  # ca_cert_file: "cert.pem"         # 替代 insecure: true；指定服务端自签证书或签发它的 CA（PEM），更安全
 
 
 # ─────────────────────────────────────────────
@@ -102,13 +104,17 @@
   cert_file: "cert.pem"
   key_file: "key.pem"
   server_name: "example.com"
-  # QUIC 接收窗口大小（可选，0 或不填 = quic-go 默认值）
-  # 适用于高带宽×高延迟（BDP 大）或并发流很多的场景，普通用途无需修改
-  # 默认值: stream 512 KB initial / 6 MB max，conn 512 KB initial / 15 MB max
-  # quic_initial_stream_receive_window: 26843545  # 25.6 MB
-  # quic_max_stream_receive_window:     26843545  # 25.6 MB
-  # quic_initial_conn_receive_window:   33554432  # 32 MB
-  # quic_max_conn_receive_window:       33554432  # 32 MB
+  # QUIC 连接参数（可选，0 或不填 = quic-go 默认值）
+  # ── 流控窗口（适合高 BDP 或大量并发流的场景）──
+  # 默认: stream 512 KB / 6 MB，conn 512 KB / 15 MB
+  # quic_initial_stream_receive_window: 8388608   # 8 MB
+  # quic_max_stream_receive_window:     8388608   # 8 MB
+  # quic_initial_conn_receive_window:   20971520  # 20 MB
+  # quic_max_conn_receive_window:       20971520  # 20 MB
+  # ── 连接行为 ──
+  # quic_max_idle_timeout: 30s          # 最大空闲超时（默认 2m）；两端取较小值
+  # quic_max_incoming_streams: 1024     # 对端最多可开的双向流数（默认 100）；仅服务端有效
+  # quic_disable_path_mtu_discovery: false  # 禁用 PMTU 探测（默认 false = 启用）
 
 # QUIC 客户端
 - is_client: true
@@ -119,12 +125,15 @@
   encryption_key: "1234567890123456"
   tls: true
   server_name: "example.com"
-  insecure: true
+  insecure: true                     # 跳过证书验证（不推荐生产环境）
+  # ca_cert_file: "cert.pem"         # 替代 insecure: true；指定服务端自签证书或签发它的 CA（PEM），更安全
   # 客户端窗口与服务端各自独立配置，两端无需相同
-  # quic_initial_stream_receive_window: 26843545
-  # quic_max_stream_receive_window:     26843545
-  # quic_initial_conn_receive_window:   33554432
-  # quic_max_conn_receive_window:       33554432
+  # quic_initial_stream_receive_window: 8388608
+  # quic_max_stream_receive_window:     8388608
+  # quic_initial_conn_receive_window:   20971520
+  # quic_max_conn_receive_window:       20971520
+  # quic_max_idle_timeout: 30s
+  # quic_disable_path_mtu_discovery: false
 
 
 # ─────────────────────────────────────────────
@@ -145,3 +154,19 @@
 #   客户端和服务端独立生效，两端无需相同，第三方客户端不设置时不影响连通性
 #   0 或不填 = quic-go 内置默认值，原有行为完全不变
 #   调大窗口可提升高延迟链路吞吐，代价是每条连接占用更多内存
+#
+# quic_max_idle_timeout（可选）:
+#   QUIC 连接最大空闲超时，两端协商取较小值，默认 2m
+#   格式: 30s / 1m30s / 2m 等 Go duration 字符串
+#
+# quic_max_incoming_streams（可选，仅服务端有效）:
+#   服务端允许单条连接上对端同时开启的最大双向流数，默认 100
+#   调大后可支持更多并发隧道复用同一 QUIC 连接
+#
+# quic_disable_path_mtu_discovery（可选）:
+#   是否禁用路径 MTU 探测（RFC 8899），默认 false（启用探测）
+#   禁用后发包大小固定为 InitialPacketSize（1452 字节）
+#
+# ca_cert_file（客户端可选）:
+#   客户端信任的 CA 证书文件路径（PEM 格式），可直接填服务端自签证书
+#   设置后无需 insecure: true 即可安全连接自签证书服务端

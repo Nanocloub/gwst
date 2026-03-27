@@ -52,20 +52,20 @@ func (c *ConnectAddrConfig) Clone() *ConnectAddrConfig {
 }
 
 type ConnectDialConfig struct {
-	Dialer        *net.Dialer
-	ListenConfig  *net.ListenConfig
-	Headers       http.Header
-	Host          string
-	Path          string
-	Target        string
-	NamedTarget   string
-	ServerName    string
-	Key           string
-	TLS           bool
-	Insecure      bool
+	Dialer       *net.Dialer
+	ListenConfig *net.ListenConfig
+	Headers      http.Header
+	Host         string
+	Path         string
+	Target       string
+	NamedTarget  string
+	ServerName   string
+	Key          string
+	TLS          bool
+	Insecure     bool
 	// CACertFile 客户端信任的 CA 证书（PEM，可直接填服务端自签证书）。
 	// 设置后无需 Insecure=true 即可验证自签证书。
-	CACertFile    string
+	CACertFile string
 	// CACertPool 内存中的 CA 证书池，优先级高于 CACertFile。
 	// 适合将证书内嵌到程序中（如 Android/iOS）或使用 GenerateSelfSignedCert 的场景。
 	CACertPool    *x509.CertPool
@@ -79,6 +79,9 @@ type ConnectDialConfig struct {
 	QUICMaxStreamReceiveWindow     uint64
 	QUICInitialConnReceiveWindow   uint64
 	QUICMaxConnReceiveWindow       uint64
+	// QUIC 额外配置
+	QUICMaxIdleTimeout          time.Duration
+	QUICDisablePathMTUDiscovery bool
 }
 
 type splitedConnectDialConfig struct {
@@ -295,6 +298,20 @@ func WithDialQUICWindowSizes(initialStream, maxStream, initialConn, maxConn uint
 		c.QUICMaxStreamReceiveWindow = maxStream
 		c.QUICInitialConnReceiveWindow = initialConn
 		c.QUICMaxConnReceiveWindow = maxConn
+	}
+}
+
+// WithDialQUICMaxIdleTimeout 设置 QUIC 连接最大空闲超时。0 表示使用默认值（2分钟）。
+func WithDialQUICMaxIdleTimeout(d time.Duration) ConnectOption {
+	return func(c *ConnectConfig) {
+		c.QUICMaxIdleTimeout = d
+	}
+}
+
+// WithDialQUICDisablePathMTUDiscovery 设置是否禁用 QUIC 路径 MTU 探测。
+func WithDialQUICDisablePathMTUDiscovery(v bool) ConnectOption {
+	return func(c *ConnectConfig) {
+		c.QUICDisablePathMTUDiscovery = v
 	}
 }
 
@@ -697,6 +714,8 @@ func connectWithTransport(ctx context.Context, cfg ConnectConfig) (net.Conn, err
 		QUICMaxStreamReceiveWindow:     cfg.QUICMaxStreamReceiveWindow,
 		QUICInitialConnReceiveWindow:   cfg.QUICInitialConnReceiveWindow,
 		QUICMaxConnReceiveWindow:       cfg.QUICMaxConnReceiveWindow,
+		QUICMaxIdleTimeout:             cfg.QUICMaxIdleTimeout,
+		QUICDisablePathMTUDiscovery:    cfg.QUICDisablePathMTUDiscovery,
 	}
 
 	// 复用全局传输管理器，避免每次拨号都重新分配 map 和工厂对象
