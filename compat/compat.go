@@ -3,6 +3,7 @@ package compat
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -81,7 +82,6 @@ type Server struct {
 	keyFile               string
 	serverName            string
 	listenAddr            string
-	selfSignedCertOptions []SelfSignedCertOption
 	waitListenCloseOnce   sync.Once
 	tls                   bool
 	transport             string // "websocket", "tcp", or "quic"
@@ -126,12 +126,6 @@ func WithTLSConfig(tlsConfig *tls.Config) ServerOption {
 			ps.tls = true
 			ps.tlsConfig = tlsConfig
 		}
-	}
-}
-
-func WithSelfSignedCert(opts ...SelfSignedCertOption) ServerOption {
-	return func(ps *Server) {
-		ps.selfSignedCertOptions = opts
 	}
 }
 
@@ -203,15 +197,8 @@ func (ps *Server) Serve() error {
 
 func (ps *Server) listenAndServeTLS(server *http.Server) error {
 	if ps.tlsConfig == nil && ps.certFile == "" && ps.keyFile == "" {
-		cert, err := GenerateSelfSignedCert(ps.serverName, ps.selfSignedCertOptions...)
-		if err != nil {
-			return fmt.Errorf("failed to generate self-signed certificate: %w", err)
-		}
-
-		ps.tlsConfig = &tls.Config{
-			Certificates: []tls.Certificate{*cert},
-			MinVersion:   tls.VersionTLS13,
-		}
+		ps.listenErr = errors.New("TLS requires either WithTLSConfig or WithTLS(certFile, keyFile)")
+		return ps.listenErr
 	}
 
 	if ps.tlsConfig != nil && ps.tlsConfig.ServerName == "" {

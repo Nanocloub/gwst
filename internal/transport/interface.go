@@ -2,8 +2,12 @@ package transport
 
 import (
 	"context"
+	"crypto/x509"
+	"errors"
+	"fmt"
 	"net"
 	"net/http"
+	"os"
 
 	"github.com/zijiren233/gwst/internal/config"
 	"github.com/zijiren233/gwst/internal/utils"
@@ -149,6 +153,14 @@ type TransportClientConfig struct {
 	// TLS 是否跳过验证
 	Insecure bool
 
+	// CACertFile 客户端信任的 CA 证书文件（PEM 格式，可直接填服务端自签证书）。
+	// 设置后，仅该 CA 签发的证书被信任；Insecure 无需设为 true。
+	CACertFile string
+
+	// CACertPool 内存中的 CA 证书池，优先级高于 CACertFile。
+	// 适合将证书内嵌到程序中（如 Android/iOS）或使用内存证书的场景。
+	CACertPool *x509.CertPool
+
 	// 额外的 HTTP Header（WebSocket 需要）
 	Headers http.Header
 
@@ -169,6 +181,25 @@ type TransportClientConfig struct {
 	QUICMaxStreamReceiveWindow     uint64
 	QUICInitialConnReceiveWindow   uint64
 	QUICMaxConnReceiveWindow       uint64
+}
+
+// LoadCACertPool 从 PEM 文件加载 CA 证书池，用于 TLS 客户端固定信任指定证书。
+func LoadCACertPool(caFile string) (*x509.CertPool, error) {
+	caPEM, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read CA cert file %q: %w", caFile, err)
+	}
+	return LoadCACertPoolFromPEM(caPEM)
+}
+
+// LoadCACertPoolFromPEM 从 PEM 字节加载 CA 证书池。
+// 适合第三方自行读取文件或从 Assets 加载后传入。
+func LoadCACertPoolFromPEM(caPEM []byte) (*x509.CertPool, error) {
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, errors.New("failed to parse CA cert: no valid PEM block found")
+	}
+	return pool, nil
 }
 
 // IsValidTransport 检查传输类型是否有效，委托给 config 实现

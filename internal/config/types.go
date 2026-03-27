@@ -85,6 +85,9 @@ type Endpoint struct {
 	KeyFile    string `yaml:"key_file"`
 	ServerName string `yaml:"server_name"`
 	Insecure   bool   `yaml:"insecure"`
+	// CACertFile 客户端信任的 CA 证书（PEM 格式，可直接填服务端自签证书）。
+	// 设置后无需 insecure: true 即可验证自签证书。
+	CACertFile string `yaml:"ca_cert_file"`
 
 	// 协议开关
 	DisableTCP          bool `yaml:"disable_tcp"`

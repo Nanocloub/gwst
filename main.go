@@ -235,6 +235,7 @@ func newClient(endpoint config.Endpoint) *compat.Forwarder {
 		compat.WithDialTLS(endpoint.TLS),
 		compat.WithDialServerName(endpoint.ServerName),
 		compat.WithInsecure(endpoint.Insecure),
+		compat.WithCACertFile(endpoint.CACertFile),
 		compat.WithKey(endpoint.Key),
 		compat.WithTransportType(endpoint.GetTransportType()),
 	}

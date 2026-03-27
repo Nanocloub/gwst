@@ -9,51 +9,6 @@ import (
 	"github.com/zijiren233/gwst/compat"
 )
 
-func TestGenerateSelfSignedCert(t *testing.T) {
-	host := "localhost"
-
-	cert, err := compat.GenerateSelfSignedCert(host)
-	if err != nil {
-		t.Fatalf("Failed to generate self-signed certificate: %v", err)
-	}
-
-	if len(cert.Certificate) == 0 {
-		t.Fatalf("Certificate is empty")
-	}
-
-	t.Logf("Generated certificate: %+v", cert)
-}
-
-func TestGenerateSelfSignedCertWithECC(t *testing.T) {
-	host := "localhost"
-
-	cert, err := compat.GenerateSelfSignedCert(host, compat.WithECC())
-	if err != nil {
-		t.Fatalf("Failed to generate self-signed certificate: %v", err)
-	}
-
-	if len(cert.Certificate) == 0 {
-		t.Fatalf("Certificate is empty")
-	}
-
-	t.Logf("Generated certificate: %+v", cert)
-}
-
-func TestGenerateSelfSignedCertWithEd25519(t *testing.T) {
-	host := "localhost"
-
-	cert, err := compat.GenerateSelfSignedCert(host, compat.WithEd25519())
-	if err != nil {
-		t.Fatalf("Failed to generate self-signed certificate: %v", err)
-	}
-
-	if len(cert.Certificate) == 0 {
-		t.Fatalf("Certificate is empty")
-	}
-
-	t.Logf("Generated certificate: %+v", cert)
-}
-
 // TestWsServerAndDialer is a manual integration test that requires manual setup
 // and cleanup. It is disabled by default to prevent hanging test runs.
 // To run this test manually, use:
@@ -109,9 +64,6 @@ func TestWsServerAndDialer(t *testing.T) {
 				compat.WithHandlerDefaultTargetAddr("127.0.0.1:8081"),
 			),
 			compat.WithListenAddr("0.0.0.0:8080"),
-			compat.WithTLS("", ""),
-			compat.WithServerName("www.microstft.com"),
-			compat.WithSelfSignedCert(compat.WithECC()),
 		)
 		_ = wss.Serve()
 	}()
@@ -122,9 +74,6 @@ func TestWsServerAndDialer(t *testing.T) {
 	wsc := compat.NewDialer(
 		compat.WithAddr("127.0.0.1:8080"),
 		compat.WithPath("/ws"),
-		compat.WithDialTLS(true),
-		compat.WithDialServerName("www.microstft.com"),
-		compat.WithInsecure(true),
 	)
 
 	conn, err := wsc.DialTCP()

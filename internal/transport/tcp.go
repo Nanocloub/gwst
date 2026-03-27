@@ -218,6 +218,16 @@ func NewTCPClientTransport(cfg TransportClientConfig) (*TCPClientTransport, erro
 			InsecureSkipVerify: cfg.Insecure,
 			MinVersion:         tls.VersionTLS13,
 		}
+		switch {
+		case cfg.CACertPool != nil:
+			tlsCfg.RootCAs = cfg.CACertPool
+		case cfg.CACertFile != "":
+			pool, err := LoadCACertPool(cfg.CACertFile)
+			if err != nil {
+				return nil, err
+			}
+			tlsCfg.RootCAs = pool
+		}
 	}
 
 	return &TCPClientTransport{

@@ -17,9 +17,9 @@ type entryWrapper[T any] struct {
 }
 
 type packetNumberIndexedQueue[T any] struct {
-	entries               RingBuffer[entryWrapper[T]]
+	entries                RingBuffer[entryWrapper[T]]
 	numberOfPresentEntries int
-	firstPacket           congestion.PacketNumber
+	firstPacket            congestion.PacketNumber
 }
 
 func newPacketNumberIndexedQueue[T any](size int) *packetNumberIndexedQueue[T] {

@@ -82,20 +82,20 @@ func newBandwidthSample() *bandwidthSample {
 
 // maxAckHeightTracker tracks the degree of ack aggregation.
 type maxAckHeightTracker struct {
-	maxAckHeightFilter                    *WindowedFilter[extraAckedEvent, roundTripCount]
-	aggregationEpochStartTime             monotime.Time
-	aggregationEpochBytes                 congestion.ByteCount
-	lastSentPacketNumberBeforeEpoch       congestion.PacketNumber
-	numAckAggregationEpochs               uint64
-	ackAggregationBandwidthThreshold      float64
+	maxAckHeightFilter                     *WindowedFilter[extraAckedEvent, roundTripCount]
+	aggregationEpochStartTime              monotime.Time
+	aggregationEpochBytes                  congestion.ByteCount
+	lastSentPacketNumberBeforeEpoch        congestion.PacketNumber
+	numAckAggregationEpochs                uint64
+	ackAggregationBandwidthThreshold       float64
 	startNewAggregationEpochAfterFullRound bool
-	reduceExtraAckedOnBandwidthIncrease   bool
+	reduceExtraAckedOnBandwidthIncrease    bool
 }
 
 func newMaxAckHeightTracker(windowLength roundTripCount) *maxAckHeightTracker {
 	return &maxAckHeightTracker{
-		maxAckHeightFilter:              NewWindowedFilter(windowLength, maxExtraAckedEventFunc),
-		lastSentPacketNumberBeforeEpoch: invalidPacketNumber,
+		maxAckHeightFilter:               NewWindowedFilter(windowLength, maxExtraAckedEventFunc),
+		lastSentPacketNumberBeforeEpoch:  invalidPacketNumber,
 		ackAggregationBandwidthThreshold: 1.0,
 	}
 }
@@ -277,12 +277,12 @@ func newConnectionStateOnSentPacket(
 
 // congestionEventSample holds bandwidth/RTT samples from a congestion event.
 type congestionEventSample struct {
-	sampleMaxBandwidth Bandwidth
-	sampleIsAppLimited bool
-	sampleRtt          time.Duration
-	sampleMaxInflight  congestion.ByteCount
+	sampleMaxBandwidth  Bandwidth
+	sampleIsAppLimited  bool
+	sampleRtt           time.Duration
+	sampleMaxInflight   congestion.ByteCount
 	lastPacketSendState sendTimeState
-	extraAcked         congestion.ByteCount
+	extraAcked          congestion.ByteCount
 }
 
 func newCongestionEventSample() *congestionEventSample {
@@ -293,33 +293,33 @@ func newCongestionEventSample() *congestionEventSample {
 
 // bandwidthSampler tracks sent/acknowledged packets and outputs bandwidth samples.
 type bandwidthSampler struct {
-	totalBytesSent                  congestion.ByteCount
-	totalBytesAcked                 congestion.ByteCount
-	totalBytesLost                  congestion.ByteCount
-	totalBytesNeutered              congestion.ByteCount
-	totalBytesSentAtLastAckedPacket congestion.ByteCount
-	lastAckedPacketSentTime         monotime.Time
-	lastAckedPacketAckTime          monotime.Time
-	lastSentPacket                  congestion.PacketNumber
-	lastAckedPacket                 congestion.PacketNumber
-	isAppLimited                    bool
-	endOfAppLimitedPhase            congestion.PacketNumber
-	connectionStateMap              *packetNumberIndexedQueue[connectionStateOnSentPacket]
-	recentAckPoints                 recentAckPoints
-	a0Candidates                    RingBuffer[ackPoint]
-	maxTrackedPackets               congestion.ByteCount
-	maxAckHeightTracker             *maxAckHeightTracker
-	totalBytesAckedAfterLastAckEvent congestion.ByteCount
-	overestimateAvoidance           bool
+	totalBytesSent                     congestion.ByteCount
+	totalBytesAcked                    congestion.ByteCount
+	totalBytesLost                     congestion.ByteCount
+	totalBytesNeutered                 congestion.ByteCount
+	totalBytesSentAtLastAckedPacket    congestion.ByteCount
+	lastAckedPacketSentTime            monotime.Time
+	lastAckedPacketAckTime             monotime.Time
+	lastSentPacket                     congestion.PacketNumber
+	lastAckedPacket                    congestion.PacketNumber
+	isAppLimited                       bool
+	endOfAppLimitedPhase               congestion.PacketNumber
+	connectionStateMap                 *packetNumberIndexedQueue[connectionStateOnSentPacket]
+	recentAckPoints                    recentAckPoints
+	a0Candidates                       RingBuffer[ackPoint]
+	maxTrackedPackets                  congestion.ByteCount
+	maxAckHeightTracker                *maxAckHeightTracker
+	totalBytesAckedAfterLastAckEvent   congestion.ByteCount
+	overestimateAvoidance              bool
 	limitMaxAckHeightTrackerBySendRate bool
 }
 
 func newBandwidthSampler(maxAckHeightTrackerWindowLength roundTripCount) *bandwidthSampler {
 	b := &bandwidthSampler{
-		maxAckHeightTracker: newMaxAckHeightTracker(maxAckHeightTrackerWindowLength),
-		connectionStateMap:  newPacketNumberIndexedQueue[connectionStateOnSentPacket](defaultConnectionStateMapQueueSize),
-		lastSentPacket:      invalidPacketNumber,
-		lastAckedPacket:     invalidPacketNumber,
+		maxAckHeightTracker:  newMaxAckHeightTracker(maxAckHeightTrackerWindowLength),
+		connectionStateMap:   newPacketNumberIndexedQueue[connectionStateOnSentPacket](defaultConnectionStateMapQueueSize),
+		lastSentPacket:       invalidPacketNumber,
+		lastAckedPacket:      invalidPacketNumber,
 		endOfAppLimitedPhase: invalidPacketNumber,
 	}
 	b.a0Candidates.Init(defaultCandidatesBufferSize)

@@ -214,11 +214,11 @@ func (qst *QUICServerTransport) Close() error {
 // 当底层连接断开时，下次 Dial 自动重建。
 type QUICClientTransport struct {
 	config      TransportClientConfig
-	mu          sync.Mutex      // 保护 conn 和 closed 字段；持有时间短
-	reconnectMu sync.Mutex      // 序列化重连操作（持有期间可能阻塞 dialNewConn）
-	conn        *quic.Conn // 持久复用的 QUIC 连接；nil 表示尚未建立或已失效
-	tlsCfg      *tls.Config     // 预构建，不可变，避免每次 Dial 重复分配
-	quicCfg     *quic.Config    // 预构建，不可变
+	mu          sync.Mutex   // 保护 conn 和 closed 字段；持有时间短
+	reconnectMu sync.Mutex   // 序列化重连操作（持有期间可能阻塞 dialNewConn）
+	conn        *quic.Conn   // 持久复用的 QUIC 连接；nil 表示尚未建立或已失效
+	tlsCfg      *tls.Config  // 预构建，不可变，避免每次 Dial 重复分配
+	quicCfg     *quic.Config // 预构建，不可变
 	closed      bool
 }
 
@@ -241,6 +241,16 @@ func NewQUICClientTransport(cfg TransportClientConfig) (*QUICClientTransport, er
 		InsecureSkipVerify: cfg.Insecure,
 		NextProtos:         []string{"gwst-quic"},
 		MinVersion:         tls.VersionTLS13,
+	}
+	switch {
+	case cfg.CACertPool != nil:
+		tlsCfg.RootCAs = cfg.CACertPool
+	case cfg.CACertFile != "":
+		pool, err := LoadCACertPool(cfg.CACertFile)
+		if err != nil {
+			return nil, err
+		}
+		tlsCfg.RootCAs = pool
 	}
 
 	quicCfg := &quic.Config{

@@ -2,6 +2,7 @@ package compat
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"maps"
@@ -62,6 +63,12 @@ type ConnectDialConfig struct {
 	Key           string
 	TLS           bool
 	Insecure      bool
+	// CACertFile 客户端信任的 CA 证书（PEM，可直接填服务端自签证书）。
+	// 设置后无需 Insecure=true 即可验证自签证书。
+	CACertFile    string
+	// CACertPool 内存中的 CA 证书池，优先级高于 CACertFile。
+	// 适合将证书内嵌到程序中（如 Android/iOS）或使用 GenerateSelfSignedCert 的场景。
+	CACertPool    *x509.CertPool
 	UDP           bool
 	LoadBalance   bool
 	TransportType string // \"websocket\", \"tcp\", or \"quic\"
@@ -165,6 +172,48 @@ func WithDialServerName(serverName string) ConnectOption {
 func WithInsecure(insecure bool) ConnectOption {
 	return func(c *ConnectConfig) {
 		c.Insecure = insecure
+	}
+}
+
+// WithCACertFile 设置客户端信任的 CA 证书文件路径（PEM 格式）。
+// 即使是服务端自签证书，只要在此指定该证书（或签发它的 CA）就可通过证书验证而无需 insecure=true。
+func WithCACertFile(caFile string) ConnectOption {
+	return func(c *ConnectConfig) {
+		c.CACertFile = caFile
+	}
+}
+
+// WithCACertPool 设置客户端信任的 CA 证书池（内存中的 *x509.CertPool）。
+// 适用于第三方自行构建证书池的场景，例如从多个 PEM 合并、或与系统根证书合并：
+//
+//	pool, _ := transport.LoadCACertPoolFromPEM(caPEM)
+//	compat.WithCACertPool(pool)
+func WithCACertPool(pool *x509.CertPool) ConnectOption {
+	return func(c *ConnectConfig) {
+		c.CACertPool = pool
+	}
+}
+
+// WithCACertPEM 从 PEM 字节设置客户端信任的 CA 证书。
+// 适合第三方自行读取文件、从 Android Assets 或嵌入资源加载后传入，无需指定文件路径：
+//
+//	caPEM, _ := os.ReadFile("/path/to/server.crt")
+//	dialer := compat.NewDialer(
+//	    compat.WithDialTLS(true),
+//	    compat.WithCACertPEM(caPEM),
+//	)
+//
+// 若 PEM 解析失败，连接时将返回错误。
+func WithCACertPEM(caPEM []byte) ConnectOption {
+	return func(c *ConnectConfig) {
+		pool, err := transport.LoadCACertPoolFromPEM(caPEM)
+		if err != nil {
+			// 标记一个空但非 nil 的 pool，在 connect() 时会因 RootCAs 不含任何证书而握手失败，
+			// 避免静默回退到系统根证书。实际错误会在 TLS 握手阶段以 "certificate signed by unknown authority" 形式呈现。
+			c.CACertPool = x509.NewCertPool()
+			return
+		}
+		c.CACertPool = pool
 	}
 }
 
@@ -446,7 +495,17 @@ func connect(ctx context.Context, cfg *splitedConnectDialConfig) (*websocket.Con
 			ServerName:         cfg.ServerName,
 			MinVersion:         tls.VersionTLS13,
 		}
-
+		switch {
+		case cfg.CACertPool != nil:
+			config.RootCAs = cfg.CACertPool
+		case cfg.CACertFile != "":
+			pool, err := transport.LoadCACertPool(cfg.CACertFile)
+			if err != nil {
+				dialConn.Close()
+				return nil, err
+			}
+			config.RootCAs = pool
+		}
 		var tlsConn *tls.UConn
 
 		tlsConn, err = createTLSClient(dialConn, config)
@@ -627,6 +686,8 @@ func connectWithTransport(ctx context.Context, cfg ConnectConfig) (net.Conn, err
 		RemoteAddr:                     cfg.Addr,
 		ServerName:                     cfg.ServerName,
 		Insecure:                       cfg.Insecure,
+		CACertFile:                     cfg.CACertFile,
+		CACertPool:                     cfg.CACertPool,
 		TLS:                            cfg.TLS,
 		Context:                        ctx,
 		Logger:                         transport.NewSafeLoggerOrNull(nil),
