@@ -5,19 +5,34 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
 
 	"github.com/aegis-aead/go-libaegis/aegis128l"
+	"github.com/aegis-aead/go-libaegis/aegis128x2"
+	"github.com/aegis-aead/go-libaegis/aegis128x4"
+)
+
+// Algorithm specifies which AEGIS variant to use.
+type Algorithm string
+
+const (
+	// AlgoAEGIS128L is the original AEGIS-128L algorithm (default).
+	AlgoAEGIS128L Algorithm = "aegis-128l"
+	// AlgoAEGIS128X2 is AEGIS-128X2, a parallelised 2-lane variant of AEGIS-128L.
+	AlgoAEGIS128X2 Algorithm = "aegis-128x2"
+	// AlgoAEGIS128X4 is AEGIS-128X4, a parallelised 4-lane variant of AEGIS-128L.
+	AlgoAEGIS128X4 Algorithm = "aegis-128x4"
 )
 
 const (
-	// KeySize AEGIS-128L key size (16 bytes)
+	// KeySize key size shared by all supported algorithms (16 bytes)
 	KeySize = 16
-	// NonceSize AEGIS-128L nonce size (16 bytes)
+	// NonceSize nonce size shared by all supported algorithms (16 bytes)
 	NonceSize = 16
-	// TagSize AEGIS-128L authentication tag size (16 bytes)
+	// TagSize authentication tag size (16 bytes)
 	TagSize = 16
 	// MaxOverhead 加密最大开销 (nonce + tag)
 	MaxOverhead = NonceSize + TagSize
@@ -25,43 +40,78 @@ const (
 
 var (
 	// ErrInvalidKeySize indicates key is not 16 bytes
-	ErrInvalidKeySize = errors.New("invalid key size for AEGIS-128L")
+	ErrInvalidKeySize = errors.New("invalid key size: must be 16 bytes")
 	// ErrInvalidCiphertext indicates ciphertext format is invalid
 	ErrInvalidCiphertext = errors.New("invalid ciphertext")
 	// ErrDecryptionFailed indicates decryption or authentication failed
 	ErrDecryptionFailed = errors.New("decryption failed")
+	// ErrUnknownAlgorithm indicates an unrecognised algorithm name
+	ErrUnknownAlgorithm = errors.New("unknown algorithm")
 )
 
-// Manager handles AEGIS-128L encryption and decryption
+// newAEAD returns a fresh cipher.AEAD for the given algorithm and key.
+func newAEAD(algo Algorithm, key []byte) (cipher.AEAD, error) {
+	switch algo {
+	case AlgoAEGIS128L, "":
+		return aegis128l.New(key, TagSize)
+	case AlgoAEGIS128X2:
+		return aegis128x2.New(key, TagSize)
+	case AlgoAEGIS128X4:
+		return aegis128x4.New(key, TagSize)
+	default:
+		return nil, fmt.Errorf("%w: %q", ErrUnknownAlgorithm, algo)
+	}
+}
+
+// Manager handles AEGIS encryption and decryption.
+// The concrete algorithm is chosen at construction time.
 type Manager struct {
-	key      []byte
+	algo     Algorithm
 	aeadPool sync.Pool
 	counter  atomic.Uint64 // 用于生成唯一 nonce（计数器部分）
 }
 
-// NewManager creates a new crypto manager with AEGIS-128L
+// NewManager creates a new crypto manager with AEGIS-128L (default algorithm).
 func NewManager(key []byte) (*Manager, error) {
+	return NewManagerWithAlgo(key, AlgoAEGIS128L)
+}
+
+// NewManagerWithAlgo creates a new crypto manager with the specified AEGIS algorithm.
+// algo may be AlgoAEGIS128L, AlgoAEGIS128X2, or AlgoAEGIS128X4.
+// An empty string is treated as AlgoAEGIS128L.
+func NewManagerWithAlgo(key []byte, algo Algorithm) (*Manager, error) {
 	if len(key) != KeySize {
 		return nil, ErrInvalidKeySize
 	}
+	if algo == "" {
+		algo = AlgoAEGIS128L
+	}
 
-	// Test creating one to ensure key/tag compatibility
-	if _, err := aegis128l.New(key, TagSize); err != nil {
+	// Copy key so caller mutations after construction cannot affect pool-allocated
+	// AEAD objects: go-libaegis stores a.Key = key (a slice reference, not a copy).
+	keyCopy := make([]byte, KeySize)
+	copy(keyCopy, key)
+
+	// Probe once to validate the algorithm and CGO availability.
+	if _, err := newAEAD(algo, keyCopy); err != nil {
 		return nil, err
 	}
 
 	m := &Manager{
-		key: key,
+		algo: algo,
 	}
 	m.aeadPool.New = func() any {
-		aead, _ := aegis128l.New(key, TagSize)
+		aead, _ := newAEAD(algo, keyCopy)
 		return aead
 	}
 
 	return m, nil
 }
 
-// Encrypt encrypts plaintext using AEGIS-128L
+// Algo returns the algorithm used by this Manager.
+func (m *Manager) Algo() Algorithm { return m.algo }
+
+// Encrypt encrypts plaintext using the configured AEGIS algorithm.
 // Returns: nonce + ciphertext + tag
 func (m *Manager) Encrypt(plaintext []byte) ([]byte, error) {
 	// 使用栈变量生成 nonce，避免堆分配
@@ -83,7 +133,7 @@ func (m *Manager) Encrypt(plaintext []byte) ([]byte, error) {
 	return ciphertext, nil
 }
 
-// Decrypt decrypts ciphertext using AEGIS-128L
+// Decrypt decrypts ciphertext using the configured AEGIS algorithm.
 // Expects: nonce + ciphertext + tag
 func (m *Manager) Decrypt(ciphertext []byte) ([]byte, error) {
 	if len(ciphertext) < NonceSize+TagSize {

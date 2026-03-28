@@ -186,12 +186,13 @@ func newServer(endpoint config.Endpoint) *compat.Server {
 		if len(endpoint.EncryptionKey) < crypto.KeySize {
 			log.Errorf("encryption_key length (%d) < %d bytes, encryption disabled", len(endpoint.EncryptionKey), crypto.KeySize)
 		} else {
-			cryptoManager, err := crypto.NewManager([]byte(endpoint.EncryptionKey[:crypto.KeySize]))
+			algo := crypto.Algorithm(endpoint.EncryptionAlgo)
+			cryptoManager, err := crypto.NewManagerWithAlgo([]byte(endpoint.EncryptionKey[:crypto.KeySize]), algo)
 			if err != nil {
 				log.Warnf("Failed to create crypto manager: %v, encryption disabled", err)
 			} else {
 				handlerOpts = append(handlerOpts, compat.WithHandlerCryptoManager(cryptoManager))
-				log.Infof("AEGIS-128L encryption enabled for server on %s", endpoint.ListenAddr)
+				log.Infof("%s encryption enabled for server on %s", cryptoManager.Algo(), endpoint.ListenAddr)
 			}
 		}
 	}
@@ -275,8 +276,12 @@ func newClient(endpoint config.Endpoint) *compat.Forwarder {
 		if len(endpoint.EncryptionKey) < crypto.KeySize {
 			log.Errorf("encryption_key length (%d) < %d bytes, encryption disabled", len(endpoint.EncryptionKey), crypto.KeySize)
 		} else {
-			opts = append(opts, compat.WithEncryptionKey(endpoint.EncryptionKey))
-			log.Infof("AEGIS-128L encryption enabled for client on %s", endpoint.ListenAddr)
+			algo := crypto.Algorithm(endpoint.EncryptionAlgo)
+			opts = append(opts, compat.WithEncryptionKeyAndAlgo(endpoint.EncryptionKey, algo))
+			if algo == "" {
+				algo = crypto.AlgoAEGIS128L
+			}
+			log.Infof("%s encryption enabled for client on %s", algo, endpoint.ListenAddr)
 		}
 	}
 

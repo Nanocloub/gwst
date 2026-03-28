@@ -257,12 +257,19 @@ func WithHeaders(headers http.Header) ConnectOption {
 // WithEncryptionKey 在连接配置中启用加密（使用 AEGIS-128L）
 // key 需至少 16 字节，仅取前 16 字节作为密钥
 func WithEncryptionKey(key string) ConnectOption {
+	return WithEncryptionKeyAndAlgo(key, crypto.AlgoAEGIS128L)
+}
+
+// WithEncryptionKeyAndAlgo 在连接配置中启用加密，并指定 AEGIS 算法变体。
+// algo 可为 crypto.AlgoAEGIS128L（默认）、crypto.AlgoAEGIS128X2 或 crypto.AlgoAEGIS128X4。
+// key 需至少 16 字节，仅取前 16 字节作为密钥。
+func WithEncryptionKeyAndAlgo(key string, algo crypto.Algorithm) ConnectOption {
 	return func(c *ConnectConfig) {
 		if len(key) < crypto.KeySize {
 			// 无效密钥长度：忽略加密设置
 			return
 		}
-		cm, err := crypto.NewManager([]byte(key[:crypto.KeySize]))
+		cm, err := crypto.NewManagerWithAlgo([]byte(key[:crypto.KeySize]), algo)
 		if err != nil {
 			return
 		}

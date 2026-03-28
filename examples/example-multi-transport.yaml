@@ -18,7 +18,8 @@
   path: "/ws"
   transport: "websocket"             # 可省略，默认为 websocket
   key: "my-auth-secret"              # X-Key 认证头，用于访问控制
-  encryption_key: "1234567890123456" # 独立数据加密密钥（推荐，16 字节，AEGIS-128L）
+  encryption_key: "1234567890123456" # 独立数据加密密钥（推荐，16 字节）
+  # encryption_algo: "aegis-128l"    # 加密算法（可选）：aegis-128l（默认）/ aegis-128x2 / aegis-128x4
   tls: true
   cert_file: "cert.pem"
   key_file: "key.pem"
@@ -33,6 +34,7 @@
   transport: "websocket"
   key: "my-auth-secret"              # 必须与服务端相同
   encryption_key: "1234567890123456" # 必须与服务端相同
+  # encryption_algo: "aegis-128l"    # 必须与服务端相同（空 = aegis-128l）
   tls: true
   server_name: "example.com"
   insecure: true                     # 跳过证书验证（不推荐生产环境）
@@ -49,6 +51,7 @@
   target_addr: "localhost:80"
   transport: "tcp"
   encryption_key: "1234567890123456"
+  encryption_algo: "aegis-128x2"     # 指定 AEGIS-128X2；不填则默认 AEGIS-128L
   tls: false
 
 # TCP 客户端
@@ -57,6 +60,7 @@
   target_addr: "127.0.0.1:8001"
   transport: "tcp"
   encryption_key: "1234567890123456"
+  encryption_algo: "aegis-128x2"     # 必须与服务端相同
   tls: false
 
 
@@ -145,9 +149,15 @@
 #   若未设置 encryption_key 且 key >= 16 字节，会用 key 前 16 字节加密（不推荐）
 #
 # encryption_key（加密，推荐）:
-#   独立的数据加密密钥，使用 AEGIS-128L 算法
-#   至少 16 字节，客户端与服务端必须完全相同
+#   独立的数据加密密钥，至少 16 字节，客户端与服务端必须完全相同
 #   优先级高于 key，两者可独立设置
+#
+# encryption_algo（可选，默认 aegis-128l）:
+#   指定加密算法变体，客户端与服务端必须完全相同：
+#     aegis-128l  — 原版 AEGIS-128L（默认，兼容最广）
+#     aegis-128x2 — 2 通道并行版本，在支持 AVX-512 的 CPU 上性能更高
+#     aegis-128x4 — 4 通道并行版本，在支持 AVX-512 的 CPU 上性能最高
+#   注意：不同算法产生的密文互不兼容，两端必须保持一致
 #
 # quic_*_receive_window（QUIC 窗口，可选）:
 #   仅对 transport: quic 有效，其他传输类型忽略

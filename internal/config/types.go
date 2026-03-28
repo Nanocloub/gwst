@@ -79,6 +79,8 @@ type Endpoint struct {
 	// 认证和加密
 	Key           string `yaml:"key"`            // 认证密钥(X-Key)，如果encryption_key未设置也用于加密
 	EncryptionKey string `yaml:"encryption_key"` // 独立的加密密钥(推荐)，优先级高于key
+	// EncryptionAlgo 加密算法，可选 "aegis-128l"（默认）、"aegis-128x2"、"aegis-128x4"
+	EncryptionAlgo string `yaml:"encryption_algo"`
 
 	// TLS 配置
 	TLS        bool   `yaml:"tls"`
@@ -153,6 +155,15 @@ func (e *Endpoint) Validate() error {
 	// 验证传输类型
 	if e.Transport != "" && !IsValidTransportString(e.Transport) {
 		return fmt.Errorf("invalid transport type: %s", e.Transport)
+	}
+
+	// 验证加密算法（空字符串表示默认 AEGIS-128L，合法）
+	if e.EncryptionAlgo != "" {
+		switch e.EncryptionAlgo {
+		case "aegis-128l", "aegis-128x2", "aegis-128x4":
+		default:
+			return fmt.Errorf("invalid encryption_algo %q: must be aegis-128l, aegis-128x2, or aegis-128x4", e.EncryptionAlgo)
+		}
 	}
 
 	// 验证 QUIC 传输必须启用 TLS
