@@ -90,7 +90,7 @@ func (qst *QUICServerTransport) Serve() error {
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"gwst-quic"},
+		NextProtos:   []string{"h3"},
 		MinVersion:   tls.VersionTLS13,
 	}
 
@@ -245,7 +245,7 @@ func NewQUICClientTransport(cfg TransportClientConfig) (*QUICClientTransport, er
 	tlsCfg := &tls.Config{
 		ServerName:         cfg.ServerName,
 		InsecureSkipVerify: cfg.Insecure,
-		NextProtos:         []string{"gwst-quic"},
+		NextProtos:         []string{"h3"},
 		MinVersion:         tls.VersionTLS13,
 	}
 	switch {
