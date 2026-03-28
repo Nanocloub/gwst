@@ -261,10 +261,15 @@ func WithEncryptionKey(key string) ConnectOption {
 }
 
 // WithEncryptionKeyAndAlgo 在连接配置中启用加密，并指定 AEGIS 算法变体。
-// algo 可为 crypto.AlgoAEGIS128L（默认）、crypto.AlgoAEGIS128X2 或 crypto.AlgoAEGIS128X4。
+// algo 可为 crypto.AlgoAEGIS128L、crypto.AlgoAEGIS128X2 或 crypto.AlgoAEGIS128X4。
+// algo 为空字符串时不启用加密（忽略 key）。
 // key 需至少 16 字节，仅取前 16 字节作为密钥。
 func WithEncryptionKeyAndAlgo(key string, algo crypto.Algorithm) ConnectOption {
 	return func(c *ConnectConfig) {
+		if algo == "" {
+			// 空算法 = 不加密
+			return
+		}
 		if len(key) < crypto.KeySize {
 			// 无效密钥长度：忽略加密设置
 			return

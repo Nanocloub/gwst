@@ -79,7 +79,9 @@ type Endpoint struct {
 	// 认证和加密
 	Key           string `yaml:"key"`            // 认证密钥(X-Key)，如果encryption_key未设置也用于加密
 	EncryptionKey string `yaml:"encryption_key"` // 独立的加密密钥(推荐)，优先级高于key
-	// EncryptionAlgo 加密算法，可选 "aegis-128l"（默认）、"aegis-128x2"、"aegis-128x4"
+	// EncryptionAlgo 加密算法。不设置或留空则不启用加密（即使设置了 encryption_key 也不生效）。
+	// 可选值："aegis-128l"（推荐）、"aegis-128x2"、"aegis-128x4"。
+	// 客户端与服务端必须设置相同的值。
 	EncryptionAlgo string `yaml:"encryption_algo"`
 
 	// TLS 配置

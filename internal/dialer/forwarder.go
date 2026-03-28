@@ -653,21 +653,22 @@ func (wf *Forwarder) handleTCP(conn net.Conn) {
 		wf.log.Errorf("Failed to dial tunnel connection: %v", err)
 		return
 	}
-	defer wsConn.Close()
 
-	// DialTCP 返回的连接包装为 CryptoConn，CryptoConn 通过编译期断言保证实现了 DeadlineWriter。
-	// 此遍断言必然成功；若失败说明调用方返回了不符合合同的对象，当 panic 处理。
+	var closeWsOnce sync.Once
+	closeWs := func() { closeWsOnce.Do(func() { wsConn.Close() }) }
+	defer closeWs()
+
 	wsConnDW := wsConn.(deadlineWriter)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		defer closeWs() // 先退出的方向负责关闭隧道，防止对端 goroutine 永久阻塞在 Read 上。
 		buffer := utils.GetBuffer(wf.tcpCopyPool)
 		defer utils.PutBuffer(wf.tcpCopyPool, buffer)
 
-		// Direction: local client -> tunnel (conn 是源，wsConnDW 是目标)
-		// 使用写超时：若隆道停止读取，写入会在 DefaultWriteTimeout 后超时退出，避免 goroutine 永久阻塞。
+		// local client -> tunnel
 		if _, err := utils.CopyBufferWithWriteTimeout(wsConnDW, conn, *buffer, utils.DefaultWriteTimeout); err != nil &&
 			!errors.Is(err, net.ErrClosed) {
 			wf.log.Warnf("Failed to copy data to tunnel: %v", err)
@@ -677,16 +678,14 @@ func (wf *Forwarder) handleTCP(conn net.Conn) {
 	buffer := utils.GetBuffer(wf.tcpCopyPool)
 	defer utils.PutBuffer(wf.tcpCopyPool, buffer)
 
-	// Direction: tunnel -> local client (wsConn 是源，conn 是目标)
-	// 使用写超时：若客户端停止读取，写入会在 DefaultWriteTimeout 后超时退出。
+	// tunnel -> local client
 	if _, err = utils.CopyBufferWithWriteTimeout(conn, wsConn, *buffer, utils.DefaultWriteTimeout); err != nil &&
 		!errors.Is(err, net.ErrClosed) {
 		wf.log.Warnf("Failed to copy data to Target: %v", err)
 	}
 
-	// 主方向结束后主动关闭双端，让 goroutine 立即退出，避免半关闭状态积压。
 	conn.Close()
-	wsConn.Close()
+	closeWs()
 
 	wg.Wait()
 }

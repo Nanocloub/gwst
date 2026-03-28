@@ -20,104 +20,131 @@ func isClosedNetworkError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "use of closed network connection")
 }
 
-// TestTCPTunnelIntegration tests a complete TCP tunnel from client -> server -> echo service
-func TestTCPTunnelIntegration(t *testing.T) {
-	// 1. Start echo TCP server
-	echoAddr := "127.0.0.1:19999"
-	echoListener, err := net.Listen("tcp", echoAddr)
-	if err != nil {
-		t.Fatalf("Failed to start echo server: %v", err)
-	}
-	defer echoListener.Close()
-
-	go func() {
-		for {
-			conn, err := echoListener.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				io.Copy(c, c) // Echo back
-			}(conn)
-		}
-	}()
-
-	// 2. Start tunnel server (WebSocket server)
-	serverAddr := "127.0.0.1:18888"
-	handler := compat.NewHandler(
-		compat.WithHandlerDefaultTargetAddr(echoAddr),
+// TestAlgoAllTransports verifies that every AEGIS algorithm variant (128L, 128X2, 128X4)
+// and the no-encryption case work correctly end-to-end on all three tunnel transport
+// modes (WebSocket, TCP, QUIC).  4 cases × 3 transports = 12 parallel sub-tests.
+func TestAlgoAllTransports(t *testing.T) {
+	const (
+		encKey   = "algo-test-key!!!"
+		testData = "算法×传输=通过"
 	)
 
-	server := compat.NewServer("/tunnel", handler,
-		compat.WithListenAddr(serverAddr),
-	)
+	certFile, keyFile, certCleanup := writeTempCertFiles(t)
+	// t.Cleanup (not defer): cleanup must run AFTER all parallel sub-tests finish,
+	// not when TestAlgoAllTransports returns (which is before parallel subs resume).
+	t.Cleanup(certCleanup)
 
-	go func() {
-		if err := server.Serve(); err != nil && err != http.ErrServerClosed {
-			t.Logf("Server error: %v", err)
+	type algoCase struct {
+		algo  crypto.Algorithm // "" = no encryption
+		label string
+	}
+	type transportCase struct {
+		name    string
+		needTLS bool
+	}
+
+	algos := []algoCase{
+		{"", "no-encrypt"},
+		{crypto.AlgoAEGIS128L, "aegis-128l"},
+		{crypto.AlgoAEGIS128X2, "aegis-128x2"},
+		{crypto.AlgoAEGIS128X4, "aegis-128x4"},
+	}
+	transports := []transportCase{
+		{"websocket", false},
+		{"tcp", false},
+		{"quic", true},
+	}
+
+	for ai, ac := range algos {
+		for ti, tc := range transports {
+			ac, tc := ac, tc
+			// Allocate 3 ports per sub-test in a safe range (47010+).
+			base := 47010 + (ai*3+ti)*3
+			echoAddr := fmt.Sprintf("127.0.0.1:%d", base)
+			serverAddr := fmt.Sprintf("127.0.0.1:%d", base+1)
+			fwdAddr := fmt.Sprintf("127.0.0.1:%d", base+2)
+
+			t.Run(ac.label+"/"+tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				// ── 1. Bidirectional echo backend ────────────────────────
+				defer startBidirEchoTCP(t, echoAddr)()
+
+				// ── 2. Tunnel server ──────────────────────────────────────
+				handlerOpts := []compat.HandlerOption{
+					compat.WithHandlerDefaultTargetAddr(echoAddr),
+				}
+				if ac.algo != "" {
+					cm, err := crypto.NewManagerWithAlgo([]byte(encKey[:crypto.KeySize]), ac.algo)
+					if err != nil {
+						t.Fatalf("NewManagerWithAlgo(%q): %v", ac.algo, err)
+					}
+					handlerOpts = append(handlerOpts, compat.WithHandlerCryptoManager(cm))
+				}
+				handler := compat.NewHandler(handlerOpts...)
+				srvOpts := []compat.ServerOption{
+					compat.WithListenAddr(serverAddr),
+					compat.WithTransport(tc.name),
+				}
+				if tc.needTLS {
+					srvOpts = append(srvOpts, compat.WithTLS(certFile, keyFile))
+				}
+				path := ""
+				if tc.name == "websocket" {
+					path = "/algo-test"
+				}
+				srv := compat.NewServer(path, handler, srvOpts...)
+				go srv.Serve() //nolint:errcheck
+				if err := srv.WaitListen(); err != nil {
+					t.Fatalf("server WaitListen: %v", err)
+				}
+				defer srv.Close()
+
+				// ── 3. Forwarder (client side) ────────────────────────────
+				dialOpts := []compat.ConnectOption{
+					compat.WithAddr(serverAddr),
+					compat.WithTransportType(tc.name),
+				}
+				if ac.algo != "" {
+					dialOpts = append(dialOpts, compat.WithEncryptionKeyAndAlgo(encKey, ac.algo))
+				}
+				if tc.name == "websocket" {
+					dialOpts = append(dialOpts, compat.WithPath("/algo-test"))
+				}
+				if tc.needTLS {
+					dialOpts = append(dialOpts, compat.WithInsecure(true))
+				}
+				d := compat.NewDialer(dialOpts...)
+				fwd := compat.NewForwarder(fwdAddr, &dialerAdapter{wsDialer: d}, compat.WithDisableUDP())
+				go fwd.Serve() //nolint:errcheck
+				<-fwd.OnListened()
+				if err := fwd.ListenErr(); err != nil {
+					t.Fatalf("forwarder ListenErr: %v", err)
+				}
+				defer fwd.Close()
+
+				// ── 4. Echo roundtrip ─────────────────────────────────────
+				conn, err := net.DialTimeout("tcp", fwdAddr, 5*time.Second)
+				if err != nil {
+					t.Fatalf("dial forwarder: %v", err)
+				}
+				defer conn.Close()
+				conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+				payload := []byte(testData)
+				if _, err := conn.Write(payload); err != nil {
+					t.Fatalf("write: %v", err)
+				}
+				got := make([]byte, len(payload))
+				if _, err := io.ReadFull(conn, got); err != nil {
+					t.Fatalf("read: %v", err)
+				}
+				if string(got) != testData {
+					t.Errorf("echo mismatch: got %q, want %q", got, testData)
+				}
+			})
 		}
-	}()
-	defer server.Close()
-
-	// Wait for server to start
-	time.Sleep(200 * time.Millisecond)
-
-	// 3. Start tunnel client (local forwarder)
-	clientAddr := "127.0.0.1:17777"
-
-	opts := []compat.ConnectOption{
-		compat.WithAddr(serverAddr),
-		compat.WithPath("/tunnel"),
 	}
-
-	wsDialer := compat.NewDialer(opts...)
-	dialerAdapter := &dialerAdapter{wsDialer: wsDialer}
-
-	forwarder := compat.NewForwarder(
-		clientAddr,
-		dialerAdapter,
-		compat.WithDisableUDP(),
-	)
-
-	go func() {
-		if err := forwarder.Serve(); err != nil && !isClosedNetworkError(err) {
-			t.Errorf("Forwarder error: %v", err)
-		}
-	}()
-	defer forwarder.Close()
-
-	// Wait for client to start
-	time.Sleep(200 * time.Millisecond)
-
-	// 4. Test the tunnel: connect to client -> tunnels to server -> reaches echo service
-	testData := "Hello, Tunnel!"
-
-	conn, err := net.DialTimeout("tcp", clientAddr, 2*time.Second)
-	if err != nil {
-		t.Fatalf("Failed to connect to client: %v", err)
-	}
-	defer conn.Close()
-
-	// Send test data
-	_, err = conn.Write([]byte(testData))
-	if err != nil {
-		t.Fatalf("Failed to write: %v", err)
-	}
-
-	// Read response
-	buf := make([]byte, len(testData))
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	_, err = io.ReadFull(conn, buf)
-	if err != nil {
-		t.Fatalf("Failed to read: %v", err)
-	}
-
-	if string(buf) != testData {
-		t.Errorf("Expected %q, got %q", testData, string(buf))
-	}
-
-	t.Logf("✓ TCP tunnel test passed: %q", testData)
 }
 
 // TestUDPTunnelIntegration tests UDP tunnel communication
@@ -349,114 +376,6 @@ func TestMultipleConnections(t *testing.T) {
 	}
 
 	t.Logf("✓ All %d concurrent connections passed", numConnections)
-}
-
-// TestTunnelWithEncryption tests tunnel with encryption enabled
-func TestTunnelWithEncryption(t *testing.T) {
-	// 1. Start echo server
-	echoAddr := "127.0.0.1:19996"
-	echoListener, err := net.Listen("tcp", echoAddr)
-	if err != nil {
-		t.Fatalf("Failed to start echo server: %v", err)
-	}
-	defer echoListener.Close()
-
-	go func() {
-		for {
-			conn, err := echoListener.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				io.Copy(c, c)
-			}(conn)
-		}
-	}()
-
-	// 2. Start tunnel server with encryption
-	encryptionKey := "test-encryption-key-32-bytes!"
-	serverAddr := "127.0.0.1:18885"
-
-	// 服务端创建加密管理器并启用加密
-	cm, err := crypto.NewManager([]byte(encryptionKey[:crypto.KeySize]))
-	if err != nil {
-		t.Fatalf("Failed to create crypto manager: %v", err)
-	}
-
-	handler := compat.NewHandler(
-		compat.WithHandlerDefaultTargetAddr(echoAddr),
-		compat.WithHandlerCryptoManager(cm),
-	)
-
-	server := compat.NewServer("/tunnel", handler,
-		compat.WithListenAddr(serverAddr),
-	)
-
-	go func() {
-		if err := server.Serve(); err != nil && err != http.ErrServerClosed {
-			t.Logf("Server error: %v", err)
-		}
-	}()
-	defer server.Close()
-
-	time.Sleep(200 * time.Millisecond)
-
-	// 3. Start tunnel client with same encryption key
-	clientAddr := "127.0.0.1:17774"
-
-	opts := []compat.ConnectOption{
-		compat.WithAddr(serverAddr),
-		compat.WithPath("/tunnel"),
-		compat.WithEncryptionKey(encryptionKey),
-	}
-
-	wsDialer := compat.NewDialer(opts...)
-	dialerAdapter := &dialerAdapter{wsDialer: wsDialer}
-
-	forwarder := compat.NewForwarder(
-		clientAddr,
-		dialerAdapter,
-		compat.WithDisableUDP(),
-	)
-
-	go func() {
-		if err := forwarder.Serve(); err != nil {
-			if !isClosedNetworkError(err) {
-				t.Errorf("Forwarder error: %v", err)
-			}
-		}
-	}()
-	defer forwarder.Close()
-
-	time.Sleep(200 * time.Millisecond)
-
-	// 4. Test encrypted tunnel
-	testData := "Encrypted Tunnel Test!"
-
-	conn, err := net.DialTimeout("tcp", clientAddr, 2*time.Second)
-	if err != nil {
-		t.Fatalf("Failed to connect: %v", err)
-	}
-	defer conn.Close()
-
-	_, err = conn.Write([]byte(testData))
-	if err != nil {
-		t.Fatalf("Failed to write: %v", err)
-	}
-
-	buf := make([]byte, len(testData))
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	_, err = io.ReadFull(conn, buf)
-	if err != nil {
-		t.Fatalf("Failed to read: %v", err)
-	}
-
-	if string(buf) != testData {
-		t.Errorf("Expected %q, got %q", testData, string(buf))
-	}
-
-	t.Logf("✓ Encrypted tunnel test passed: %q", testData)
 }
 
 // TestTunnelReconnection tests that tunnel can recover from disconnection

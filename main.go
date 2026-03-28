@@ -181,8 +181,8 @@ func newServer(endpoint config.Endpoint) *compat.Server {
 		compat.WithHandlerKey(endpoint.Key),
 	}
 
-	// encryption_key 独立处理数据加密
-	if endpoint.EncryptionKey != "" {
+	// encryption_key + encryption_algo 同时非空才启用加密；algo 为空则不加密
+	if endpoint.EncryptionKey != "" && endpoint.EncryptionAlgo != "" {
 		if len(endpoint.EncryptionKey) < crypto.KeySize {
 			log.Errorf("encryption_key length (%d) < %d bytes, encryption disabled", len(endpoint.EncryptionKey), crypto.KeySize)
 		} else {
@@ -271,16 +271,13 @@ func newClient(endpoint config.Endpoint) *compat.Forwarder {
 		compat.WithLogger(log.StandardLogger()),
 	}
 
-	// encryption_key 独立处理数据加密（通过 ConnectOption 下发到 Dialer）
-	if endpoint.EncryptionKey != "" {
+	// encryption_key + encryption_algo 同时非空才启用加密；algo 为空则不加密
+	if endpoint.EncryptionKey != "" && endpoint.EncryptionAlgo != "" {
 		if len(endpoint.EncryptionKey) < crypto.KeySize {
 			log.Errorf("encryption_key length (%d) < %d bytes, encryption disabled", len(endpoint.EncryptionKey), crypto.KeySize)
 		} else {
 			algo := crypto.Algorithm(endpoint.EncryptionAlgo)
 			opts = append(opts, compat.WithEncryptionKeyAndAlgo(endpoint.EncryptionKey, algo))
-			if algo == "" {
-				algo = crypto.AlgoAEGIS128L
-			}
 			log.Infof("%s encryption enabled for client on %s", algo, endpoint.ListenAddr)
 		}
 	}
