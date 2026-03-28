@@ -518,7 +518,7 @@ func (h *Handler) handleUDP(ws *websocket.Conn, addr string, fallbackAddrs []str
 
 		// Tunnel -> Target
 		if _, err := utils.CopyBufferWithWriteTimeout(conn, tunnelConn, *readBuffer, utils.DefaultWriteTimeout); err != nil &&
-			!errors.Is(err, net.ErrClosed) {
+			!errors.Is(err, net.ErrClosed) && !utils.IsStreamCancelError(err) {
 			h.log.Infof("Failed to copy data from Tunnel to Target: %v", err)
 		}
 	}()
@@ -527,7 +527,7 @@ func (h *Handler) handleUDP(ws *websocket.Conn, addr string, fallbackAddrs []str
 	writeBuffer := utils.GetBuffer(h.bufferPool)
 	defer utils.PutBuffer(h.bufferPool, writeBuffer)
 	if _, err := utils.CopyBufferWithWriteTimeout(tunnelConn.(utils.DeadlineWriter), &udpTargetConn{Conn: conn, idleTimeout: h.udpIdleTimeout}, *writeBuffer, utils.DefaultWriteTimeout); err != nil &&
-		!errors.Is(err, net.ErrClosed) {
+		!errors.Is(err, net.ErrClosed) && !utils.IsStreamCancelError(err) {
 		h.log.Infof("Failed to copy data from Target to Tunnel: %v", err)
 	}
 
@@ -562,7 +562,7 @@ func (h *Handler) handleNetwork(ws *websocket.Conn, network, addr string, fallba
 
 		// Tunnel -> Target
 		if _, err := utils.CopyBufferWithWriteTimeout(conn, tunnelConn, *buffer, utils.DefaultWriteTimeout); err != nil &&
-			!errors.Is(err, net.ErrClosed) {
+			!errors.Is(err, net.ErrClosed) && !utils.IsStreamCancelError(err) {
 			h.log.Infof("Failed to copy data to Target: %v", err)
 		}
 	}()
@@ -572,7 +572,7 @@ func (h *Handler) handleNetwork(ws *websocket.Conn, network, addr string, fallba
 
 	// Target -> Tunnel
 	if _, err := utils.CopyBufferWithWriteTimeout(tunnelConn.(utils.DeadlineWriter), conn, *buffer, utils.DefaultWriteTimeout); err != nil &&
-		!errors.Is(err, net.ErrClosed) {
+		!errors.Is(err, net.ErrClosed) && !utils.IsStreamCancelError(err) {
 		h.log.Infof("Failed to copy data to Tunnel: %v", err)
 	}
 
@@ -784,7 +784,7 @@ func (h *Handler) HandleRawConnection(conn net.Conn, protocol, target string, fa
 
 		// Tunnel -> Target
 		if _, err := utils.CopyBufferWithWriteTimeout(targetConn, tunnelConn, *buffer, utils.DefaultWriteTimeout); err != nil &&
-			!errors.Is(err, net.ErrClosed) {
+			!errors.Is(err, net.ErrClosed) && !utils.IsStreamCancelError(err) {
 			h.log.Infof("Failed to copy data to Target: %v", err)
 		}
 	}()
@@ -794,7 +794,7 @@ func (h *Handler) HandleRawConnection(conn net.Conn, protocol, target string, fa
 
 	// Target -> Tunnel
 	if _, err := utils.CopyBufferWithWriteTimeout(tunnelConn.(deadlineWriter), targetConn, *buffer, utils.DefaultWriteTimeout); err != nil &&
-		!errors.Is(err, net.ErrClosed) {
+		!errors.Is(err, net.ErrClosed) && !utils.IsStreamCancelError(err) {
 		h.log.Infof("Failed to copy data to Tunnel: %v", err)
 	}
 
@@ -880,7 +880,7 @@ func (h *Handler) handleRawUDP(conn net.Conn, addr string, fallbackAddrs []strin
 		defer utils.PutBuffer(h.bufferPool, buffer)
 
 		if _, err := io.CopyBuffer(targetConn, tunnelConn, *buffer); err != nil &&
-			!errors.Is(err, net.ErrClosed) {
+			!errors.Is(err, net.ErrClosed) && !utils.IsStreamCancelError(err) {
 			h.log.Infof("Failed to copy data from Tunnel to UDP Target: %v", err)
 		}
 	}()
@@ -891,7 +891,7 @@ func (h *Handler) handleRawUDP(conn net.Conn, addr string, fallbackAddrs []strin
 	defer utils.PutBuffer(h.bufferPool, buffer)
 
 	if _, err := utils.CopyBufferWithWriteTimeout(tunnelConn.(deadlineWriter), &udpTargetConn{Conn: targetConn, idleTimeout: h.udpIdleTimeout}, *buffer, utils.DefaultWriteTimeout); err != nil &&
-		!errors.Is(err, net.ErrClosed) {
+		!errors.Is(err, net.ErrClosed) && !utils.IsStreamCancelError(err) {
 		h.log.Infof("Failed to copy data from UDP Target to Tunnel: %v", err)
 	}
 

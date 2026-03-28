@@ -670,7 +670,7 @@ func (wf *Forwarder) handleTCP(conn net.Conn) {
 
 		// local client -> tunnel
 		if _, err := utils.CopyBufferWithWriteTimeout(wsConnDW, conn, *buffer, utils.DefaultWriteTimeout); err != nil &&
-			!errors.Is(err, net.ErrClosed) {
+			!errors.Is(err, net.ErrClosed) && !utils.IsStreamCancelError(err) {
 			wf.log.Warnf("Failed to copy data to tunnel: %v", err)
 		}
 	}()
@@ -680,7 +680,7 @@ func (wf *Forwarder) handleTCP(conn net.Conn) {
 
 	// tunnel -> local client
 	if _, err = utils.CopyBufferWithWriteTimeout(conn, wsConn, *buffer, utils.DefaultWriteTimeout); err != nil &&
-		!errors.Is(err, net.ErrClosed) {
+		!errors.Is(err, net.ErrClosed) && !utils.IsStreamCancelError(err) {
 		wf.log.Warnf("Failed to copy data to Target: %v", err)
 	}
 

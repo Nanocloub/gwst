@@ -142,6 +142,15 @@ func CopyBufferWithWriteTimeout(
 	return written, err
 }
 
+func IsStreamCancelError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "canceled by local with error code 0") ||
+		strings.Contains(msg, "canceled by remote with error code 0")
+}
+
 // IsStreamConn 检查连接是否是流式连接（TCP/QUIC），而不是 WebSocket
 func IsStreamConn(conn any) bool {
 	if conn == nil {
