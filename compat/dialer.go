@@ -618,7 +618,17 @@ func setReqHeader(
 func dialWithTimeout(ctx context.Context, dialer *net.Dialer, addr, port string) (net.Conn, error) {
 	timeoutCtx, cancel := context.WithTimeout(ctx, time.Second*5)
 	defer cancel()
-	return dialer.DialContext(timeoutCtx, "tcp", fmt.Sprintf("%s:%s", addr, port))
+	conn, err := dialer.DialContext(timeoutCtx, "tcp", fmt.Sprintf("%s:%s", addr, port))
+	if err != nil {
+		return nil, err
+	}
+	// 启用 OS keepalive：检测 WebSocket 隧道死连接，防止 v2bx goroutine 积压。
+	// 必须在 TLS/WebSocket 升级前设置，升级后底层 *net.TCPConn 已被包裹无法断言。
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(30 * time.Second)
+	}
+	return conn, nil
 }
 
 func createTLSClient(conn net.Conn, config *tls.Config) (*tls.UConn, error) {

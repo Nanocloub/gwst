@@ -245,6 +245,11 @@ func (ps *Server) listenAndServeTLS(server *http.Server) error {
 	}
 	defer ln.Close()
 
+	// Go 的 http.Server.ServeTLS 会将 listener 包裹为 TLS listener，导致
+	// Serve() 内部的 *net.TCPListener 断言失败，自动 keepalive 不生效。
+	// 用 tcpKeepAliveListener 包裹后，Accept() 在 TLS 升级前就已启用 keepalive。
+	ln = tcpKeepAliveListener{ln}
+
 	ps.closeWaitListen()
 
 	server.TLSConfig = ps.tlsConfig
@@ -276,6 +281,10 @@ func (ps *Server) listenAndServe(server *http.Server) error {
 		return err
 	}
 	defer ln.Close()
+
+	// 用 tcpKeepAliveListener 包裹，覆盖 Go http.Server 默认 3 分钟的 keepalive 周期，
+	// 统一为 30s，与 TCP/QUIC 隧道一致。
+	ln = tcpKeepAliveListener{ln}
 
 	ps.closeWaitListen()
 
@@ -428,4 +437,23 @@ func (ps *Server) createTransportHandler() func(net.Conn) error {
 		// 调用 Handler 的内部处理逻辑
 		return ps.wsHandler.HandleRawConnection(conn, protocol, target, fallbackAddrs)
 	}
+}
+
+// tcpKeepAliveListener 包装 net.Listener，在每个 Accept 的连接上启用 OS TCP keepalive（30s 周期）。
+// http.Server.ServeTLS 会将 listener 包为 TLS listener，导致 Go 内部的 *net.TCPListener 断言失败，
+// 自动 keepalive 不生效；本 wrapper 在 TLS 升级前设置，确保 TLS/非 TLS 场景均生效。
+type tcpKeepAliveListener struct {
+	net.Listener
+}
+
+func (ln tcpKeepAliveListener) Accept() (net.Conn, error) {
+	conn, err := ln.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(30 * time.Second)
+	}
+	return conn, nil
 }

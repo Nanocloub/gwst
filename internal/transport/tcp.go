@@ -258,6 +258,13 @@ func (tct *TCPClientTransport) Dial(ctx context.Context) (net.Conn, error) {
 		return nil, fmt.Errorf("failed to dial: %w", err)
 	}
 
+	// 启用 OS keepalive：检测 TCP 隧道死连接，防止 v2bx goroutine 积压。
+	// 必须在 TLS 握手前设置，握手后 *net.TCPConn 已被 tls.Conn 包裹而无法断言。
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+
 	if tct.tlsCfg != nil {
 		// tls.Client 复用预构建的 tlsCfg（不可变），无需每次分配
 		tlsConn := tls.Client(conn, tct.tlsCfg)

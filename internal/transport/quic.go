@@ -118,13 +118,10 @@ func (qst *QUICServerTransport) Serve() error {
 	}
 
 	// Create QUIC listener
-	maxIdleTimeout := 2 * time.Minute
-	if qst.config.QUICMaxIdleTimeout > 0 {
-		maxIdleTimeout = qst.config.QUICMaxIdleTimeout
-	}
+	// MaxIdleTimeout=0 → quic-go 内置默认 30s；两端协商取较小值
 	initialPacketSize := resolveInitialPacketSize(qst.config.QUICInitialPacketSize)
 	listener, err := quic.ListenAddr(qst.config.ListenAddr, tlsConfig, &quic.Config{
-		MaxIdleTimeout:                 maxIdleTimeout,
+		MaxIdleTimeout:                 qst.config.QUICMaxIdleTimeout,
 		KeepAlivePeriod:                30 * time.Second,
 		InitialPacketSize:              initialPacketSize,
 		InitialStreamReceiveWindow:     qst.config.QUICInitialStreamReceiveWindow,
@@ -283,14 +280,10 @@ func NewQUICClientTransport(cfg TransportClientConfig) (*QUICClientTransport, er
 		tlsCfg.RootCAs = pool
 	}
 
-	maxIdleTimeout := 2 * time.Minute
-	if cfg.QUICMaxIdleTimeout > 0 {
-		maxIdleTimeout = cfg.QUICMaxIdleTimeout
-	}
 	initialPacketSize := resolveInitialPacketSize(cfg.QUICInitialPacketSize)
 	quicCfg := &quic.Config{
-		MaxIdleTimeout:  maxIdleTimeout,
-		KeepAlivePeriod: 30 * time.Second,
+		MaxIdleTimeout:                 cfg.QUICMaxIdleTimeout, // 0 → quic-go 内置默认 30s
+		KeepAlivePeriod:                30 * time.Second,
 		InitialPacketSize:              initialPacketSize,
 		InitialStreamReceiveWindow:     cfg.QUICInitialStreamReceiveWindow,
 		MaxStreamReceiveWindow:         cfg.QUICMaxStreamReceiveWindow,

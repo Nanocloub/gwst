@@ -116,7 +116,7 @@
   # quic_initial_conn_receive_window:   20971520  # 20 MB
   # quic_max_conn_receive_window:       20971520  # 20 MB
   # ── 连接行为 ──
-  # quic_max_idle_timeout: 30s          # 最大空闲超时（默认 2m）；两端取较小值
+  # quic_max_idle_timeout: 30s          # 最大空闲超时（0 不填 = quic-go 内置默认 30s）；两端协商取较小值
   # quic_max_incoming_streams: 1024     # 对端最多可开的双向流数（默认 100）；仅服务端有效
   # quic_initial_packet_size: 1452      # 初始 UDP 包大小（字节），同时作为 BBR 拥塞控制的初始 datagram 大小
                                         # 0 或不填 = 1452（标准以太网最大无分片值）
@@ -173,8 +173,8 @@
 #   调大窗口可提升高延迟链路吞吐，代价是每条连接占用更多内存
 #
 # quic_max_idle_timeout（可选）:
-#   QUIC 连接最大空闲超时，两端协商取较小值，默认 2m
-#   格式: 30s / 1m30s / 2m 等 Go duration 字符串
+#   QUIC 连接最大空闲超时，两端协商取较小值；0 不填 = quic-go 内置默认 30s
+#   格式: 30s / 1m / 2m 等 Go duration 字符串；建议不低于 KeepAlivePeriod（30s）
 #
 # quic_max_incoming_streams（可选，仅服务端有效）:
 #   服务端允许单条连接上对端同时开启的最大双向流数，默认 100
