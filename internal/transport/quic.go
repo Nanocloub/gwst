@@ -31,12 +31,35 @@ type QUICServerTransport struct {
 	cancel context.CancelFunc
 }
 
-// quicInitialPacketSize is the initial UDP packet size used for both quic.Config
-// and BBR congestion control initialization, ensuring they are consistent.
+// defaultQuicInitialPacketSize is the default initial UDP packet size:
+// 1500 (Ethernet) - 20 (IPv4) - 8 (UDP) - 20 (QUIC overhead) = 1452.
+// This skips the quic-go default 1280-byte warmup phase on standard Ethernet paths.
 // quic-go's SetCongestionControl does NOT propagate the current datagram size
 // to the replacement CC, so BBR must be initialized with the same value as
 // quic.Config.InitialPacketSize to avoid pacing budget mismatches.
-const quicInitialPacketSize uint16 = 1452
+const (
+	defaultQuicInitialPacketSize uint16 = 1452
+	minQuicInitialPacketSize     uint16 = 1200 // QUIC spec minimum (RFC 9000 §14)
+)
+
+// resolveInitialPacketSize returns the configured value clamped to [1200, 1452],
+// or the default (1452) when configured is 0.
+// Clamping is essential: quic-go silently clamps values below 1200 to 1200
+// inside populateConfig, so if we let an out-of-range value reach both
+// quic.Config.InitialPacketSize and BBR's initialMaxDatagramSize, they would
+// diverge and cause pacing budget mismatches.
+func resolveInitialPacketSize(configured uint16) uint16 {
+	if configured == 0 {
+		return defaultQuicInitialPacketSize
+	}
+	if configured < minQuicInitialPacketSize {
+		return minQuicInitialPacketSize
+	}
+	if configured > defaultQuicInitialPacketSize {
+		return defaultQuicInitialPacketSize
+	}
+	return configured
+}
 
 // NewQUICServerTransport 创建 QUIC 服务端传输
 func NewQUICServerTransport(cfg TransportServerConfig) (*QUICServerTransport, error) {
@@ -99,10 +122,11 @@ func (qst *QUICServerTransport) Serve() error {
 	if qst.config.QUICMaxIdleTimeout > 0 {
 		maxIdleTimeout = qst.config.QUICMaxIdleTimeout
 	}
+	initialPacketSize := resolveInitialPacketSize(qst.config.QUICInitialPacketSize)
 	listener, err := quic.ListenAddr(qst.config.ListenAddr, tlsConfig, &quic.Config{
 		MaxIdleTimeout:                 maxIdleTimeout,
 		KeepAlivePeriod:                30 * time.Second,
-		InitialPacketSize:              quicInitialPacketSize, // 直接使用最大允许包大小，跳过 PMTU 热身
+		InitialPacketSize:              initialPacketSize,
 		InitialStreamReceiveWindow:     qst.config.QUICInitialStreamReceiveWindow,
 		MaxStreamReceiveWindow:         qst.config.QUICMaxStreamReceiveWindow,
 		InitialConnectionReceiveWindow: qst.config.QUICInitialConnReceiveWindow,
@@ -134,7 +158,7 @@ func (qst *QUICServerTransport) Serve() error {
 			continue
 		}
 
-		setBBR(conn)
+		setBBR(conn, initialPacketSize) // reuse the same value given to quic.Config
 		qst.connectionWg.Add(1)
 		go qst.handleConnection(conn)
 	}
@@ -263,13 +287,11 @@ func NewQUICClientTransport(cfg TransportClientConfig) (*QUICClientTransport, er
 	if cfg.QUICMaxIdleTimeout > 0 {
 		maxIdleTimeout = cfg.QUICMaxIdleTimeout
 	}
+	initialPacketSize := resolveInitialPacketSize(cfg.QUICInitialPacketSize)
 	quicCfg := &quic.Config{
 		MaxIdleTimeout:  maxIdleTimeout,
 		KeepAlivePeriod: 30 * time.Second,
-		// 直接使用 quic-go 允许的最大包大小（1452 字节），跳过从 1280 开始的
-		// PMTU 探测热身阶段。对于本地/局域网场景（loopback MTU=65535）可立即
-		// 使用最大包，减少同等数据量所需的 UDP 数据包数。
-		InitialPacketSize:              quicInitialPacketSize,
+		InitialPacketSize:              initialPacketSize,
 		InitialStreamReceiveWindow:     cfg.QUICInitialStreamReceiveWindow,
 		MaxStreamReceiveWindow:         cfg.QUICMaxStreamReceiveWindow,
 		InitialConnectionReceiveWindow: cfg.QUICInitialConnReceiveWindow,
@@ -291,18 +313,19 @@ func (qct *QUICClientTransport) isAlive() bool {
 }
 
 // setBBR sets BBR congestion control on a QUIC connection.
-// The initialMaxDatagramSize must match quicInitialPacketSize used in quic.Config,
-// because quic-go's SetCongestionControl does not propagate the current datagram
-// size to the newly installed CC.
-func setBBR(conn *quic.Conn) {
+// initialPacketSize must match quic.Config.InitialPacketSize used when the
+// connection was dialed/accepted, because quic-go's SetCongestionControl does
+// not propagate the current datagram size to the newly installed CC.
+func setBBR(conn *quic.Conn, initialPacketSize uint16) {
 	conn.SetCongestionControl(bbr.NewBbrSender(
 		bbr.DefaultClock{},
-		congestion.ByteCount(quicInitialPacketSize),
+		congestion.ByteCount(initialPacketSize),
 	))
 }
 
 // dialNewConn 建立全新的 QUIC 连接。只读取不可变字段（config/tlsCfg/quicCfg），无需持锁。
 func (qct *QUICClientTransport) dialNewConn(ctx context.Context) (*quic.Conn, error) {
+	pktSize := qct.quicCfg.InitialPacketSize
 	if qct.config.ListenConfig != nil {
 		pconn, err := qct.config.ListenConfig.ListenPacket(ctx, "udp", "")
 		if err != nil {
@@ -319,14 +342,14 @@ func (qct *QUICClientTransport) dialNewConn(ctx context.Context) (*quic.Conn, er
 			pconn.Close()
 			return nil, err
 		}
-		setBBR(conn)
+		setBBR(conn, pktSize)
 		return conn, nil
 	}
 	conn, err := quic.DialAddr(ctx, qct.config.RemoteAddr, qct.tlsCfg, qct.quicCfg)
 	if err != nil {
 		return nil, err
 	}
-	setBBR(conn)
+	setBBR(conn, pktSize)
 	return conn, nil
 }
 

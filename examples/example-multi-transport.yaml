@@ -118,7 +118,12 @@
   # ── 连接行为 ──
   # quic_max_idle_timeout: 30s          # 最大空闲超时（默认 2m）；两端取较小值
   # quic_max_incoming_streams: 1024     # 对端最多可开的双向流数（默认 100）；仅服务端有效
+  # quic_initial_packet_size: 1452      # 初始 UDP 包大小（字节），同时作为 BBR 拥塞控制的初始 datagram 大小
+                                        # 0 或不填 = 1452（标准以太网最大无分片值）
+                                        # 取值范围 [1200, 1452]；超出范围自动夹边
+                                        # 跨公网建议 1200（保守），局域网/loopback 建议 1452（默认，减少包数）
   # quic_disable_path_mtu_discovery: false  # 禁用 PMTU 探测（默认 false = 启用）
+                                            # 禁用后发包大小固定为 quic_initial_packet_size
 
 # QUIC 客户端
 - is_client: true
@@ -137,6 +142,8 @@
   # quic_initial_conn_receive_window:   20971520
   # quic_max_conn_receive_window:       20971520
   # quic_max_idle_timeout: 30s
+  # quic_initial_packet_size: 1452      # 客户端与服务端各自独立配置，两端无需相同
+                                        # 取值范围 [1200, 1452]，0 或不填 = 1452
   # quic_disable_path_mtu_discovery: false
 
 
@@ -173,9 +180,17 @@
 #   服务端允许单条连接上对端同时开启的最大双向流数，默认 100
 #   调大后可支持更多并发隧道复用同一 QUIC 连接
 #
+# quic_initial_packet_size（可选）:
+#   初始 UDP 包大小（字节），同时用于初始化 BBR 拥塞控制的 datagram 大小
+#   取值范围 [1200, 1452]，超出范围会自动夹边；0 或不填 = 默认值 1452
+#   1452 = 1500（标准以太网 MTU）- 20（IPv4）- 8（UDP）- 20（QUIC 开销）
+#   跨公网/不确定路径建议配置 1200（QUIC 规范最小值，任何路径均可通过）
+#   局域网/loopback 建议保持 1452（减少同等数据量所需的 UDP 包数）
+#   启用 PMTU 探测时此值为探测起点；禁用时则固定为此大小
+#
 # quic_disable_path_mtu_discovery（可选）:
 #   是否禁用路径 MTU 探测（RFC 8899），默认 false（启用探测）
-#   禁用后发包大小固定为 InitialPacketSize（1452 字节）
+#   禁用后发包大小固定为 quic_initial_packet_size
 #
 # ca_cert_file（客户端可选）:
 #   客户端信任的 CA 证书文件路径（PEM 格式），可直接填服务端自签证书

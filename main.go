@@ -226,6 +226,9 @@ func newServer(endpoint config.Endpoint) *compat.Server {
 	if endpoint.QUICMaxIncomingStreams != 0 {
 		opts = append(opts, compat.WithQUICMaxIncomingStreams(endpoint.QUICMaxIncomingStreams))
 	}
+	if endpoint.QUICInitialPacketSize != 0 {
+		opts = append(opts, compat.WithQUICInitialPacketSize(endpoint.QUICInitialPacketSize))
+	}
 	if endpoint.QUICDisablePathMTUDiscovery {
 		opts = append(opts, compat.WithQUICDisablePathMTUDiscovery(true))
 	}
@@ -262,6 +265,9 @@ func newClient(endpoint config.Endpoint) *compat.Forwarder {
 	}
 	if endpoint.QUICMaxIdleTimeout != 0 {
 		opts = append(opts, compat.WithDialQUICMaxIdleTimeout(endpoint.QUICMaxIdleTimeout))
+	}
+	if endpoint.QUICInitialPacketSize != 0 {
+		opts = append(opts, compat.WithDialQUICInitialPacketSize(endpoint.QUICInitialPacketSize))
 	}
 	if endpoint.QUICDisablePathMTUDiscovery {
 		opts = append(opts, compat.WithDialQUICDisablePathMTUDiscovery(true))

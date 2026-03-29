@@ -111,6 +111,10 @@ type Endpoint struct {
 	QUICMaxIdleTimeout time.Duration `yaml:"quic_max_idle_timeout"`
 	// QUIC 服务端允许对端打开的最大双向流数，0 表示使用 quic-go 默认值（100），仅服务端有效
 	QUICMaxIncomingStreams int64 `yaml:"quic_max_incoming_streams"`
+	// QUIC 初始包大小（字节），同时作为 BBR 拥塞控制的初始 datagram 大小。
+	// 0 表示使用内部默认值（1452）。取值范围：[1200, 1452]。
+	// 启用路径 MTU 探测时此为探测起点；禁用时则固定为此大小。
+	QUICInitialPacketSize uint16 `yaml:"quic_initial_packet_size"`
 	// 是否禁用 QUIC 路径 MTU 探测（RFC 8899），默认 false
 	QUICDisablePathMTUDiscovery bool `yaml:"quic_disable_path_mtu_discovery"`
 }

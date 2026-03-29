@@ -81,6 +81,7 @@ type ConnectDialConfig struct {
 	QUICMaxConnReceiveWindow       uint64
 	// QUIC 额外配置
 	QUICMaxIdleTimeout          time.Duration
+	QUICInitialPacketSize       uint16
 	QUICDisablePathMTUDiscovery bool
 }
 
@@ -317,6 +318,13 @@ func WithDialQUICWindowSizes(initialStream, maxStream, initialConn, maxConn uint
 func WithDialQUICMaxIdleTimeout(d time.Duration) ConnectOption {
 	return func(c *ConnectConfig) {
 		c.QUICMaxIdleTimeout = d
+	}
+}
+
+// WithDialQUICInitialPacketSize 设置 QUIC 初始包大小（字节）。取值范围：[1200, 1452]，0 表示使用默认值（1452）。
+func WithDialQUICInitialPacketSize(size uint16) ConnectOption {
+	return func(c *ConnectConfig) {
+		c.QUICInitialPacketSize = size
 	}
 }
 
@@ -727,6 +735,7 @@ func connectWithTransport(ctx context.Context, cfg ConnectConfig) (net.Conn, err
 		QUICInitialConnReceiveWindow:   cfg.QUICInitialConnReceiveWindow,
 		QUICMaxConnReceiveWindow:       cfg.QUICMaxConnReceiveWindow,
 		QUICMaxIdleTimeout:             cfg.QUICMaxIdleTimeout,
+		QUICInitialPacketSize:          cfg.QUICInitialPacketSize,
 		QUICDisablePathMTUDiscovery:    cfg.QUICDisablePathMTUDiscovery,
 	}
 

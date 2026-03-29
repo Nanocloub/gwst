@@ -130,6 +130,8 @@ type TransportServerConfig struct {
 	QUICMaxIdleTimeout time.Duration
 	// QUIC 允许对端打开的最大双向流数，0 表示使用 quic-go 默认值（100）
 	QUICMaxIncomingStreams int64
+	// QUIC 初始包大小（字节），0 表示使用内部默认值（1452）
+	QUICInitialPacketSize uint16
 	// 是否禁用 QUIC 路径 MTU 探测
 	QUICDisablePathMTUDiscovery bool
 }
@@ -190,6 +192,8 @@ type TransportClientConfig struct {
 	QUICMaxConnReceiveWindow       uint64
 	// QUIC 连接最大空闲超时，0 表示使用默认值（2分钟）
 	QUICMaxIdleTimeout time.Duration
+	// QUIC 初始包大小（字节），0 表示使用内部默认值（1452）
+	QUICInitialPacketSize uint16
 	// 是否禁用 QUIC 路径 MTU 探测
 	QUICDisablePathMTUDiscovery bool
 }

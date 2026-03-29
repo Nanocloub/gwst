@@ -93,6 +93,7 @@ type Server struct {
 	// QUIC 额外配置
 	quicMaxIdleTimeout          time.Duration
 	quicMaxIncomingStreams      int64
+	quicInitialPacketSize       uint16
 	quicDisablePathMTUDiscovery bool
 }
 
@@ -162,6 +163,13 @@ func WithQUICMaxIdleTimeout(d time.Duration) ServerOption {
 func WithQUICMaxIncomingStreams(n int64) ServerOption {
 	return func(ps *Server) {
 		ps.quicMaxIncomingStreams = n
+	}
+}
+
+// WithQUICInitialPacketSize 设置 QUIC 初始包大小（字节）。取值范围：[1200, 1452]，0 表示使用默认值（1452）。
+func WithQUICInitialPacketSize(size uint16) ServerOption {
+	return func(ps *Server) {
+		ps.quicInitialPacketSize = size
 	}
 }
 
@@ -354,6 +362,7 @@ func (ps *Server) serveWithTransport() error {
 		QUICMaxConnReceiveWindow:       ps.quicMaxConnRecvWindow,
 		QUICMaxIdleTimeout:             ps.quicMaxIdleTimeout,
 		QUICMaxIncomingStreams:         ps.quicMaxIncomingStreams,
+		QUICInitialPacketSize:          ps.quicInitialPacketSize,
 		QUICDisablePathMTUDiscovery:    ps.quicDisablePathMTUDiscovery,
 	}
 
