@@ -21,9 +21,9 @@ jobs:
           - target: linux/amd64
             goos: linux
             goarch: amd64
-            cc: gcc
+            cc: musl-gcc
             output: gwst-linux-amd64
-            apt_packages: ""
+            apt_packages: musl-tools
           # - target: linux/arm64
           #   goos: linux
           #   goarch: arm64
@@ -46,7 +46,7 @@ jobs:
           go-version-file: "go.mod"
           check-latest: false
 
-      - name: Install cross-compiler
+      - name: Install build dependencies
         if: ${{ matrix.apt_packages != '' }}
         run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt_packages }}
 
@@ -58,7 +58,7 @@ jobs:
           CC: ${{ matrix.cc }}
         run: |
           mkdir -p dist
-          go build -trimpath -ldflags="-s -w" -o dist/${{ matrix.output }} .
+          go build -trimpath -ldflags="-s -w -extldflags '-static'" -o dist/${{ matrix.output }} .
 
       - name: Get Artifact Name
         id: artifact_name
