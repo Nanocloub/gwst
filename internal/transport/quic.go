@@ -120,6 +120,7 @@ func (qst *QUICServerTransport) Serve() error {
 	// Create QUIC listener
 	// MaxIdleTimeout=0 → quic-go 内置默认 30s；两端协商取较小值
 	initialPacketSize := resolveInitialPacketSize(qst.config.QUICInitialPacketSize)
+
 	listener, err := quic.ListenAddr(qst.config.ListenAddr, tlsConfig, &quic.Config{
 		MaxIdleTimeout:                 qst.config.QUICMaxIdleTimeout,
 		KeepAlivePeriod:                30 * time.Second,
@@ -351,9 +352,10 @@ func (qct *QUICClientTransport) dialNewConn(ctx context.Context) (*quic.Conn, er
 //
 // 并发设计：
 //   - mu 仅用于原子读取/清零 conn 字段（持有时间极短，微秒级）
-//   - OpenStreamSync 在无锁状态下调用，允许多个 goroutine 同时在同一 QUIC
-//     连接上并发开流，互不阻塞（quic.Connection 的方法是 goroutine-safe）
-//   - reconnectMu 序列化重连操作，确保最多一个 goroutine 执行 dialNewConn
+//   - OpenStreamSync 始终在 reconnectMu 之外调用，允许多个 goroutine 同时在同一
+//     QUIC 连接上并发开流，互不阻塞（quic.Connection 的方法是 goroutine-safe）
+//   - reconnectMu 仅在 dialNewConn 期间持有，序列化重连操作，确保最多一个
+//     goroutine 执行握手；连接建立后立即释放，OpenStreamSync 并发进行
 func (qct *QUICClientTransport) Dial(ctx context.Context) (net.Conn, error) {
 	// 快速路径：在 mu 保护下获取当前连接引用，然后立即释放 mu。
 	// OpenStreamSync 在锁外调用，允许并发流开启。
@@ -382,14 +384,16 @@ func (qct *QUICClientTransport) Dial(ctx context.Context) (net.Conn, error) {
 		qct.mu.Unlock()
 	}
 
-	// 慢路径：需要重建连接；用 reconnectMu 序列化，防止多个 goroutine 同时创建
+	// 慢路径：需要重建连接；用 reconnectMu 序列化 dialNewConn，防止多个 goroutine
+	// 同时握手。注意：不使用 defer，在连接就绪后立即手动释放，确保 OpenStreamSync
+	// 始终在 reconnectMu 之外并发执行。
 	qct.reconnectMu.Lock()
-	defer qct.reconnectMu.Unlock()
 
 	// 二次检查：持有 reconnectMu 期间可能已有其他 goroutine 完成了重连
 	qct.mu.Lock()
 	if qct.closed {
 		qct.mu.Unlock()
+		qct.reconnectMu.Unlock()
 		return nil, net.ErrClosed
 	}
 	conn = qct.conn
@@ -399,42 +403,40 @@ func (qct *QUICClientTransport) Dial(ctx context.Context) (net.Conn, error) {
 	}
 	qct.mu.Unlock()
 
-	if conn != nil {
-		// 其他 goroutine 已重连，直接复用新连接开流（还是在锁外调用）
-		stream, err := conn.OpenStreamSync(ctx)
-		if err == nil {
-			return &quicStreamConn{stream: stream, conn: conn}, nil
+	if conn == nil {
+		// 建立全新 QUIC 连接（耗时操作，在 reconnectMu 保护下只执行一次）
+		newConn, err := qct.dialNewConn(ctx)
+		if err != nil {
+			qct.reconnectMu.Unlock()
+			return nil, err
 		}
+		qct.mu.Lock()
+		if qct.closed {
+			qct.mu.Unlock()
+			qct.reconnectMu.Unlock()
+			newConn.CloseWithError(0, "transport closed")
+			return nil, net.ErrClosed
+		}
+		qct.conn = newConn
+		qct.mu.Unlock()
+		conn = newConn
+	}
+
+	// 连接已就绪（来自二次检查或新建），立即释放 reconnectMu。
+	// 后续 OpenStreamSync 并发执行，不持有任何锁。
+	qct.reconnectMu.Unlock()
+
+	stream, err := conn.OpenStreamSync(ctx) // 无锁调用，并发安全
+	if err != nil {
+		// 流开启失败（连接已死），清空缓存；调用方重试时将重新握手
 		qct.mu.Lock()
 		if qct.conn == conn {
 			qct.conn = nil
 		}
 		qct.mu.Unlock()
-	}
-
-	// 建立全新 QUIC 连接
-	newConn, err := qct.dialNewConn(ctx)
-	if err != nil {
 		return nil, err
 	}
-
-	stream, err := newConn.OpenStreamSync(ctx)
-	if err != nil {
-		newConn.CloseWithError(0, "failed to open stream")
-		return nil, err
-	}
-
-	qct.mu.Lock()
-	if qct.closed {
-		qct.mu.Unlock()
-		stream.CancelRead(0)
-		stream.Close()
-		newConn.CloseWithError(0, "transport closed")
-		return nil, net.ErrClosed
-	}
-	qct.conn = newConn
-	qct.mu.Unlock()
-	return &quicStreamConn{stream: stream, conn: newConn}, nil
+	return &quicStreamConn{stream: stream, conn: conn}, nil
 }
 
 // Close 关闭 QUIC 连接
