@@ -676,7 +676,9 @@ func createTLSClient(conn net.Conn, config *tls.Config) (*tls.UConn, error) {
 }
 
 type Dialer struct {
-	config ConnectConfig
+	config        ConnectConfig
+	resolvedMu    sync.RWMutex
+	resolvedCache map[string]string // domain -> first-resolved IP
 }
 
 func NewDialer(options ...ConnectOption) *Dialer {
@@ -700,7 +702,94 @@ func (wc *Dialer) DialContext(
 		option(cfg)
 	}
 
+	// Pin the server address to the IP resolved on the very first dial.
+	// This prevents DNS round-robin or TTL expiry from landing subsequent
+	// connections on a different backend IP, keeping the "entry IP" stable
+	// for the lifetime of this Dialer across all transport types
+	// (websocket, tcp, quic).
+	wc.pinAddr(ctx, cfg)
+
 	return ConnectWithConfig(ctx, *cfg)
+}
+
+// pinAddr resolves the hostname in cfg.Addr exactly once, caches the result,
+// and rewrites cfg.Addr to the cached IP so every subsequent WebSocket dial
+// lands on the same server.  cfg.Host and cfg.ServerName are pre-set to the
+// original domain so that TLS SNI and the HTTP Host header remain correct.
+func (wc *Dialer) pinAddr(ctx context.Context, cfg *ConnectConfig) {
+	host, port, err := net.SplitHostPort(cfg.Addr)
+	if err != nil {
+		// No port separator — treat the whole addr as the host.
+		host = cfg.Addr
+		port = ""
+	}
+
+	// Nothing to do when addr is already a numeric IP.
+	if net.ParseIP(host) != nil {
+		return
+	}
+
+	// Pre-populate Host/ServerName with the original domain before we
+	// potentially replace Addr with a bare IP address, so that TLS SNI
+	// and the HTTP Host header stay correct.
+	if cfg.Host == "" {
+		if cfg.ServerName != "" {
+			cfg.Host = cfg.ServerName
+		} else if port != "" {
+			cfg.Host = net.JoinHostPort(host, port)
+		} else {
+			cfg.Host = host
+		}
+	}
+	if cfg.ServerName == "" {
+		cfg.ServerName = host
+	}
+
+	// Fast path: return cached IP under read lock.
+	wc.resolvedMu.RLock()
+	ip, ok := wc.resolvedCache[host]
+	wc.resolvedMu.RUnlock()
+	if ok {
+		if port != "" {
+			cfg.Addr = net.JoinHostPort(ip, port)
+		} else {
+			cfg.Addr = ip
+		}
+		return
+	}
+
+	// Slow path: resolve under write lock with double-check to avoid races.
+	wc.resolvedMu.Lock()
+	defer wc.resolvedMu.Unlock()
+
+	if ip, ok = wc.resolvedCache[host]; ok {
+		if port != "" {
+			cfg.Addr = net.JoinHostPort(ip, port)
+		} else {
+			cfg.Addr = ip
+		}
+		return
+	}
+
+	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	ips, lookupErr := net.DefaultResolver.LookupHost(lookupCtx, host)
+	if lookupErr != nil || len(ips) == 0 {
+		// Resolution failed — fall back to dialing the domain name as-is.
+		return
+	}
+
+	ip = ips[0]
+	if wc.resolvedCache == nil {
+		wc.resolvedCache = make(map[string]string)
+	}
+	wc.resolvedCache[host] = ip
+
+	if port != "" {
+		cfg.Addr = net.JoinHostPort(ip, port)
+	} else {
+		cfg.Addr = ip
+	}
 }
 
 func (wc *Dialer) Dial(network string, options ...ConnectOption) (net.Conn, error) {
