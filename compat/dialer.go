@@ -475,13 +475,21 @@ func generateDialConfig(addr string, cfg ConnectDialConfig) (*splitedConnectDial
 	if cfg.Host == "" {
 		if cfg.ServerName != "" {
 			cfg.Host = cfg.ServerName
+		} else if strings.Contains(addr, ":") {
+			// IPv6 literal: wrap in brackets with port for HTTP Host header and WebSocket URL
+			cfg.Host = net.JoinHostPort(addr, port)
 		} else {
 			cfg.Host = addr
 		}
 	}
 
 	if cfg.ServerName == "" {
-		cfg.ServerName = cfg.Host
+		if strings.Contains(addr, ":") {
+			// IPv6: TLS SNI requires bare address without brackets or port
+			cfg.ServerName = addr
+		} else {
+			cfg.ServerName = cfg.Host
+		}
 	}
 
 	cfg.Path = ensureLeadingSlash(cfg.Path)
@@ -493,6 +501,11 @@ func parseAddrAndPort(addr string, tlsEnabled bool) (string, string, error) {
 	domain, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		if strings.Contains(err.Error(), "missing port in address") {
+			// Strip brackets from bare bracketed IPv6 like "[::1]" → "::1".
+			// Without this, net.JoinHostPort("[::1]", port) would produce "[[::1]]:port".
+			if strings.HasPrefix(addr, "[") && strings.HasSuffix(addr, "]") {
+				addr = addr[1 : len(addr)-1]
+			}
 			return addr, defaultPort(tlsEnabled), nil
 		}
 		return "", "", fmt.Errorf("failed to split host and port: %w", err)
@@ -618,7 +631,8 @@ func setReqHeader(
 func dialWithTimeout(ctx context.Context, dialer *net.Dialer, addr, port string) (net.Conn, error) {
 	timeoutCtx, cancel := context.WithTimeout(ctx, time.Second*5)
 	defer cancel()
-	conn, err := dialer.DialContext(timeoutCtx, "tcp", fmt.Sprintf("%s:%s", addr, port))
+	// net.JoinHostPort correctly handles IPv6 by adding brackets: [::1]:8080
+	conn, err := dialer.DialContext(timeoutCtx, "tcp", net.JoinHostPort(addr, port))
 	if err != nil {
 		return nil, err
 	}
@@ -714,8 +728,34 @@ func (wc *Dialer) CryptoManager() utils.CryptoManager {
 	return wc.config.ConnectDialConfig.CryptoManager
 }
 
-// connectWithTransport 使用 transport 包进行连接（TCP 或 QUIC）
+// connectWithTransport 使用 transport 包进行连接（TCP 或 QUIC），支持 fallback_addrs
 func connectWithTransport(ctx context.Context, cfg ConnectConfig) (net.Conn, error) {
+	if cfg.LoadBalance {
+		cfg.Addr, cfg.FallbackAddrs = balanceTargets(cfg.Addr, cfg.FallbackAddrs)
+	}
+
+	conn, primaryErr := dialTransportConnection(ctx, cfg, cfg.Addr)
+	if primaryErr == nil {
+		return conn, nil
+	}
+
+	if len(cfg.FallbackAddrs) == 0 {
+		return nil, fmt.Errorf("failed to connect to %s: %w", cfg.Addr, primaryErr)
+	}
+
+	errs := []error{fmt.Errorf("failed to connect to %s: %w", cfg.Addr, primaryErr)}
+	for _, fallbackAddr := range cfg.FallbackAddrs {
+		conn, err := dialTransportConnection(ctx, cfg, fallbackAddr)
+		if err == nil {
+			return conn, nil
+		}
+		errs = append(errs, fmt.Errorf("failed to connect to %s: %w", fallbackAddr, err))
+	}
+	return nil, errors.Join(errs...)
+}
+
+// dialTransportConnection 向单个地址建立 TCP/QUIC 传输连接
+func dialTransportConnection(ctx context.Context, cfg ConnectConfig, addr string) (net.Conn, error) {
 	// 将 transport 字符串转换为 TransportType
 	var transportType transport.TransportType
 	switch cfg.TransportType {
@@ -730,7 +770,7 @@ func connectWithTransport(ctx context.Context, cfg ConnectConfig) (net.Conn, err
 	// 创建传输配置
 	transportCfg := transport.TransportClientConfig{
 		Type:                           transportType,
-		RemoteAddr:                     cfg.Addr,
+		RemoteAddr:                     addr,
 		ServerName:                     cfg.ServerName,
 		Insecure:                       cfg.Insecure,
 		CACertFile:                     cfg.CACertFile,
@@ -764,8 +804,7 @@ func connectWithTransport(ctx context.Context, cfg ConnectConfig) (net.Conn, err
 		return nil, err
 	}
 
-	// 发送协议标识字节
-	// 0x01 = TCP, 0x02 = UDP
+	// 发送协议标识字节：0x01 = TCP, 0x02 = UDP
 	protocolByte := byte(0x01)
 	if cfg.UDP {
 		protocolByte = 0x02

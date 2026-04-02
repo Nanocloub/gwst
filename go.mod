@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/aegis-aead/go-libaegis v0.2.13
-	github.com/apernet/quic-go v0.59.1-0.20260217092621-db4786c77a22
+	github.com/apernet/quic-go v0.59.1-0.20260330051153-c402ee641eb6
 	github.com/panjf2000/ants/v2 v2.11.3
 	github.com/refraction-networking/utls v1.8.0
 	github.com/sirupsen/logrus v1.9.3

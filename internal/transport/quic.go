@@ -314,6 +314,7 @@ func setBBR(conn *quic.Conn, initialPacketSize uint16) {
 	conn.SetCongestionControl(bbr.NewBbrSender(
 		bbr.DefaultClock{},
 		congestion.ByteCount(initialPacketSize),
+		bbr.ProfileStandard,
 	))
 }
 
