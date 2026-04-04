@@ -676,7 +676,9 @@ func createTLSClient(conn net.Conn, config *tls.Config) (*tls.UConn, error) {
 }
 
 type Dialer struct {
-	config ConnectConfig
+	config      ConnectConfig
+	pinMu       sync.RWMutex
+	pinnedAddrs map[string]string // port → "ip:port"
 }
 
 func NewDialer(options ...ConnectOption) *Dialer {
@@ -686,6 +688,49 @@ func NewDialer(options ...ConnectOption) *Dialer {
 	}
 
 	return wc
+}
+
+// getPinnedAddr returns the pinned "ip:port" for the given addr's port, or "".
+func (wc *Dialer) getPinnedAddr(addr string) string {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return ""
+	}
+	wc.pinMu.RLock()
+	defer wc.pinMu.RUnlock()
+	return wc.pinnedAddrs[port]
+}
+
+// setPinnedAddrIfNotSet pins addr for its port only if that port is not yet
+// pinned (first-writer-wins semantics, safe for concurrent callers).
+func (wc *Dialer) setPinnedAddrIfNotSet(addr string) {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return
+	}
+	wc.pinMu.Lock()
+	defer wc.pinMu.Unlock()
+	if wc.pinnedAddrs == nil {
+		wc.pinnedAddrs = make(map[string]string)
+	}
+	if _, exists := wc.pinnedAddrs[port]; !exists {
+		wc.pinnedAddrs[port] = addr
+	}
+}
+
+// clearPinnedAddr removes the pin for addr's port only when the currently
+// pinned value equals addr, preventing a racing goroutine from clearing a
+// pin that was already updated by the recovery path.
+func (wc *Dialer) clearPinnedAddr(addr string) {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return
+	}
+	wc.pinMu.Lock()
+	defer wc.pinMu.Unlock()
+	if wc.pinnedAddrs != nil && wc.pinnedAddrs[port] == addr {
+		delete(wc.pinnedAddrs, port)
+	}
 }
 
 func (wc *Dialer) DialContext(
@@ -700,7 +745,40 @@ func (wc *Dialer) DialContext(
 		option(cfg)
 	}
 
-	return ConnectWithConfig(ctx, *cfg)
+	// load_balance intentionally distributes across fallback_addrs; skip pinning.
+	if cfg.LoadBalance {
+		return ConnectWithConfig(ctx, *cfg)
+	}
+
+	originalAddr := cfg.Addr
+
+	// Redirect to the pinned IP when a different IP arrives for the same port.
+	if originalAddr != "" {
+		if pinned := wc.getPinnedAddr(originalAddr); pinned != "" && pinned != originalAddr {
+			cfg.Addr = pinned
+		}
+	}
+
+	conn, err := ConnectWithConfig(ctx, *cfg)
+	if err != nil {
+		if cfg.Addr != originalAddr {
+			// Pinned IP failed: clear it, retry with the original IP, pin on success.
+			wc.clearPinnedAddr(cfg.Addr)
+			cfg.Addr = originalAddr
+			conn, err = ConnectWithConfig(ctx, *cfg)
+			if err == nil {
+				wc.setPinnedAddrIfNotSet(cfg.Addr)
+			}
+			return conn, err
+		}
+		// Original IP failed too; clear pin so next dial can pick a fresh IP.
+		wc.clearPinnedAddr(cfg.Addr)
+		return nil, err
+	}
+
+	// Success: record this IP as the pin for future dials on the same port.
+	wc.setPinnedAddrIfNotSet(cfg.Addr)
+	return conn, nil
 }
 
 func (wc *Dialer) Dial(network string, options ...ConnectOption) (net.Conn, error) {
