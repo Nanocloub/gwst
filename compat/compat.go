@@ -95,6 +95,8 @@ type Server struct {
 	quicMaxIncomingStreams      int64
 	quicInitialPacketSize       uint16
 	quicDisablePathMTUDiscovery bool
+	quicCongestionType          string
+	quicBBRProfile              string
 }
 
 type ServerOption func(*Server)
@@ -177,6 +179,20 @@ func WithQUICInitialPacketSize(size uint16) ServerOption {
 func WithQUICDisablePathMTUDiscovery(v bool) ServerOption {
 	return func(ps *Server) {
 		ps.quicDisablePathMTUDiscovery = v
+	}
+}
+
+// WithQUICCongestionType 设置 QUIC 拥塞控制类型。""/"bbr" 使用 BBR，"reno" 使用 New Reno。
+func WithQUICCongestionType(t string) ServerOption {
+	return func(ps *Server) {
+		ps.quicCongestionType = t
+	}
+}
+
+// WithQUICBBRProfile 设置 QUIC BBR 拥塞控制预设。可选值："standard"、"conservative"、"aggressive"。
+func WithQUICBBRProfile(profile string) ServerOption {
+	return func(ps *Server) {
+		ps.quicBBRProfile = profile
 	}
 }
 
@@ -373,6 +389,8 @@ func (ps *Server) serveWithTransport() error {
 		QUICMaxIncomingStreams:         ps.quicMaxIncomingStreams,
 		QUICInitialPacketSize:          ps.quicInitialPacketSize,
 		QUICDisablePathMTUDiscovery:    ps.quicDisablePathMTUDiscovery,
+		QUICCongestionType:             ps.quicCongestionType,
+		QUICBBRProfile:                 ps.quicBBRProfile,
 	}
 
 	// 创建传输管理器

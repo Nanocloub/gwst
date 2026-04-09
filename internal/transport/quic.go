@@ -156,7 +156,7 @@ func (qst *QUICServerTransport) Serve() error {
 			continue
 		}
 
-		setBBR(conn, initialPacketSize) // reuse the same value given to quic.Config
+		applyCongestion(conn, initialPacketSize, qst.config.QUICCongestionType, qst.config.QUICBBRProfile)
 		qst.connectionWg.Add(1)
 		go qst.handleConnection(conn)
 	}
@@ -306,16 +306,28 @@ func (qct *QUICClientTransport) isAlive() bool {
 	return !qct.closed && (qct.conn == nil || qct.conn.Context().Err() == nil)
 }
 
-// setBBR sets BBR congestion control on a QUIC connection.
-// initialPacketSize must match quic.Config.InitialPacketSize used when the
-// connection was dialed/accepted, because quic-go's SetCongestionControl does
-// not propagate the current datagram size to the newly installed CC.
-func setBBR(conn *quic.Conn, initialPacketSize uint16) {
-	conn.SetCongestionControl(bbr.NewBbrSender(
-		bbr.DefaultClock{},
-		congestion.ByteCount(initialPacketSize),
-		bbr.ProfileStandard,
-	))
+// applyCongestion applies the configured congestion control to a QUIC connection.
+// Mirrors hysteria's congestion.UseConfigured: "reno" is a no-op (quic-go's
+// built-in New Reno stays); "" / "bbr" installs BBR with the given profile.
+//
+// NOTE: unlike hysteria, we receive initialPacketSize explicitly instead of
+// calling bbr.GetInitialPacketSize(conn.RemoteAddr()). That is intentional:
+// gwst sets quic.Config.InitialPacketSize = 1452 (non-standard default), and
+// quic-go's SetCongestionControl does NOT propagate the current datagram size
+// to the replacement CC. Passing the wrong seed value would corrupt BBR's
+// pacing budget until the next PMTU probe fires.
+func applyCongestion(conn *quic.Conn, initialPacketSize uint16, congestionType, bbrProfile string) {
+	switch congestionType {
+	case "reno":
+		// Keep quic-go's built-in New Reno; do nothing.
+		return
+	default: // "", "bbr"
+		conn.SetCongestionControl(bbr.NewBbrSender(
+			bbr.DefaultClock{},
+			congestion.ByteCount(initialPacketSize),
+			bbr.Profile(bbrProfile), // "" → applyProfile defaults to ProfileStandard
+		))
+	}
 }
 
 // dialNewConn 建立全新的 QUIC 连接。只读取不可变字段（config/tlsCfg/quicCfg），无需持锁。
@@ -337,14 +349,14 @@ func (qct *QUICClientTransport) dialNewConn(ctx context.Context) (*quic.Conn, er
 			pconn.Close()
 			return nil, err
 		}
-		setBBR(conn, pktSize)
+		applyCongestion(conn, pktSize, qct.config.QUICCongestionType, qct.config.QUICBBRProfile)
 		return conn, nil
 	}
 	conn, err := quic.DialAddr(ctx, qct.config.RemoteAddr, qct.tlsCfg, qct.quicCfg)
 	if err != nil {
 		return nil, err
 	}
-	setBBR(conn, pktSize)
+	applyCongestion(conn, pktSize, qct.config.QUICCongestionType, qct.config.QUICBBRProfile)
 	return conn, nil
 }
 

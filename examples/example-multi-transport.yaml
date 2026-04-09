@@ -124,6 +124,9 @@
                                         # 跨公网建议 1200（保守），局域网/loopback 建议 1452（默认，减少包数）
   # quic_disable_path_mtu_discovery: false  # 禁用 PMTU 探测（默认 false = 启用）
                                             # 禁用后发包大小固定为 quic_initial_packet_size
+  # ── 拥塞控制（可选，各端独立配置，互不影响）──
+  # quic_congestion_type: bbr          # 拥塞控制算法：bbr（默认）/ reno
+  # quic_bbr_profile: standard         # BBR 预设（仅 bbr 有效）：standard（默认）/ conservative / aggressive
 
 # QUIC 客户端
 - is_client: true
@@ -145,6 +148,8 @@
   # quic_initial_packet_size: 1452      # 客户端与服务端各自独立配置，两端无需相同
                                         # 取值范围 [1200, 1452]，0 或不填 = 1452
   # quic_disable_path_mtu_discovery: false
+  # quic_congestion_type: bbr          # 拥塞控制算法：bbr（默认）/ reno
+  # quic_bbr_profile: standard         # BBR 预设（仅 bbr 有效）：standard（默认）/ conservative / aggressive
 
 
 # ─────────────────────────────────────────────
@@ -191,6 +196,17 @@
 # quic_disable_path_mtu_discovery（可选）:
 #   是否禁用路径 MTU 探测（RFC 8899），默认 false（启用探测）
 #   禁用后发包大小固定为 quic_initial_packet_size
+#
+# quic_congestion_type（可选，仅 transport: quic 有效）:
+#   QUIC 拥塞控制算法，各端独立配置，互不影响，无需两端相同
+#     bbr   — Google BBR v1（默认）
+#     reno  — New Reno（quic-go 内置默认控制器，更保守）
+#
+# quic_bbr_profile（可选，仅 quic_congestion_type: bbr 有效）:
+#   BBR 行为预设，各端独立配置
+#     standard     — 标准预设（默认）
+#     conservative — 更保守：降低峰值增益、开启过冲检测、减少窗口，适合共享/受限链路
+#     aggressive   — 更激进：提高峰值增益、延长慢启动、增大窗口，适合低竞争高带宽链路
 #
 # ca_cert_file（客户端可选）:
 #   客户端信任的 CA 证书文件路径（PEM 格式），可直接填服务端自签证书

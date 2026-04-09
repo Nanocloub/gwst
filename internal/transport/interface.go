@@ -134,6 +134,10 @@ type TransportServerConfig struct {
 	QUICInitialPacketSize uint16
 	// 是否禁用 QUIC 路径 MTU 探测
 	QUICDisablePathMTUDiscovery bool
+	// QUIC 拥塞控制类型：""/"bbr" 使用 BBR，"reno" 使用 New Reno
+	QUICCongestionType string
+	// BBR 预设："standard"（默认）、"conservative"、"aggressive"
+	QUICBBRProfile string
 }
 
 // TransportClientConfig 客户端传输配置
@@ -196,6 +200,10 @@ type TransportClientConfig struct {
 	QUICInitialPacketSize uint16
 	// 是否禁用 QUIC 路径 MTU 探测
 	QUICDisablePathMTUDiscovery bool
+	// QUIC 拥塞控制类型：""/"bbr" 使用 BBR，"reno" 使用 New Reno
+	QUICCongestionType string
+	// BBR 预设："standard"（默认）、"conservative"、"aggressive"
+	QUICBBRProfile string
 }
 
 // LoadCACertPool 从 PEM 文件加载 CA 证书池，用于 TLS 客户端固定信任指定证书。

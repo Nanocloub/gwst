@@ -117,6 +117,13 @@ type Endpoint struct {
 	QUICInitialPacketSize uint16 `yaml:"quic_initial_packet_size"`
 	// 是否禁用 QUIC 路径 MTU 探测（RFC 8899），默认 false
 	QUICDisablePathMTUDiscovery bool `yaml:"quic_disable_path_mtu_discovery"`
+
+	// QUIC 拥塞控制类型。仅对 transport: quic 有效。
+	// 可选值："bbr"（默认）、"reno"
+	QUICCongestionType string `yaml:"quic_congestion_type"`
+	// QUIC BBR 拥塞控制预设。仅当 quic_congestion_type 为 "bbr"（或默认）时有效。
+	// 可选值："standard"（默认）、"conservative"、"aggressive"
+	QUICBBRProfile string `yaml:"quic_bbr_profile"`
 }
 
 // Endpoints 表示配置文件中的所有端点
@@ -170,6 +177,18 @@ func (e *Endpoint) Validate() error {
 		default:
 			return fmt.Errorf("invalid encryption_algo %q: must be aegis-128l, aegis-128x2, or aegis-128x4", e.EncryptionAlgo)
 		}
+	}
+
+	// 验证 QUIC 拥塞控制配置
+	switch e.QUICCongestionType {
+	case "", "bbr", "reno":
+	default:
+		return fmt.Errorf("invalid quic_congestion_type %q: must be bbr or reno", e.QUICCongestionType)
+	}
+	switch e.QUICBBRProfile {
+	case "", "standard", "conservative", "aggressive":
+	default:
+		return fmt.Errorf("invalid quic_bbr_profile %q: must be standard, conservative, or aggressive", e.QUICBBRProfile)
 	}
 
 	// 验证 QUIC 传输必须启用 TLS

@@ -232,6 +232,12 @@ func newServer(endpoint config.Endpoint) *compat.Server {
 	if endpoint.QUICDisablePathMTUDiscovery {
 		opts = append(opts, compat.WithQUICDisablePathMTUDiscovery(true))
 	}
+	if endpoint.QUICCongestionType != "" {
+		opts = append(opts, compat.WithQUICCongestionType(endpoint.QUICCongestionType))
+	}
+	if endpoint.QUICBBRProfile != "" {
+		opts = append(opts, compat.WithQUICBBRProfile(endpoint.QUICBBRProfile))
+	}
 
 	return compat.NewServer(endpoint.Path, handler, opts...)
 }
@@ -271,6 +277,12 @@ func newClient(endpoint config.Endpoint) *compat.Forwarder {
 	}
 	if endpoint.QUICDisablePathMTUDiscovery {
 		opts = append(opts, compat.WithDialQUICDisablePathMTUDiscovery(true))
+	}
+	if endpoint.QUICCongestionType != "" {
+		opts = append(opts, compat.WithDialQUICCongestionType(endpoint.QUICCongestionType))
+	}
+	if endpoint.QUICBBRProfile != "" {
+		opts = append(opts, compat.WithDialQUICBBRProfile(endpoint.QUICBBRProfile))
 	}
 
 	forwarderOpts := []compat.ForwarderOption{

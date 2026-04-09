@@ -83,6 +83,8 @@ type ConnectDialConfig struct {
 	QUICMaxIdleTimeout          time.Duration
 	QUICInitialPacketSize       uint16
 	QUICDisablePathMTUDiscovery bool
+	QUICCongestionType          string
+	QUICBBRProfile              string
 }
 
 type splitedConnectDialConfig struct {
@@ -335,6 +337,19 @@ func WithDialQUICDisablePathMTUDiscovery(v bool) ConnectOption {
 	}
 }
 
+// WithDialQUICCongestionType 设置 QUIC 拥塞控制类型。""/"bbr" 使用 BBR，"reno" 使用 New Reno。
+func WithDialQUICCongestionType(t string) ConnectOption {
+	return func(c *ConnectConfig) {
+		c.QUICCongestionType = t
+	}
+}
+
+// WithDialQUICBBRProfile 设置 QUIC BBR 拥塞控制预设。可选值："standard"、"conservative"、"aggressive"。
+func WithDialQUICBBRProfile(profile string) ConnectOption {
+	return func(c *ConnectConfig) {
+		c.QUICBBRProfile = profile
+	}
+}
 func Connect(ctx context.Context, opts ...ConnectOption) (net.Conn, error) {
 	cfg := ConnectConfig{}
 	for _, opt := range opts {
@@ -865,6 +880,8 @@ func dialTransportConnection(ctx context.Context, cfg ConnectConfig, addr string
 		QUICMaxIdleTimeout:             cfg.QUICMaxIdleTimeout,
 		QUICInitialPacketSize:          cfg.QUICInitialPacketSize,
 		QUICDisablePathMTUDiscovery:    cfg.QUICDisablePathMTUDiscovery,
+		QUICCongestionType:             cfg.QUICCongestionType,
+		QUICBBRProfile:                 cfg.QUICBBRProfile,
 	}
 
 	// 复用全局传输管理器，避免每次拨号都重新分配 map 和工厂对象
