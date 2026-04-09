@@ -144,6 +144,15 @@ func (c *CryptoConn) Read(b []byte) (int, error) {
 				continue // 空帧，跳过
 			}
 
+			// 非加密 stream 快速路径：帧数据直接读入调用方 b，
+			// 跳过 pool buffer 的 Get/Put 和数据拷贝。
+			if c.cm == nil && ln <= len(b) {
+				if _, err = io.ReadFull(c.Conn, b[:ln]); err != nil {
+					return 0, err
+				}
+				return ln, nil
+			}
+
 			// ln 来自 uint16，最大 65535 < UDPBufferSize(65599)，
 			// 因此 pool buffer 始终足够，无需 oversized 分支。
 			bufPtr = cryptoBufferPool.Get().(*[]byte)
@@ -219,29 +228,29 @@ func (c *CryptoConn) Write(b []byte) (int, error) {
 		return 0, nil
 	}
 
-	bufPtr := cryptoBufferPool.Get().(*[]byte)
-	defer cryptoBufferPool.Put(bufPtr)
-	tmpBuf := *bufPtr
-
 	if !c.isStream {
-		// WebSocket: Write encrypted payload directly
-		// 性能关键：直接加密到 tmpBuf，一次写入
+		// WebSocket mode
+		if c.cm == nil {
+			// 非加密 WebSocket：直接写入原始数据，无需 pool buffer
+			_, err := c.Conn.Write(b)
+			return len(b), err
+		}
+		// 加密 WebSocket：使用 pool buffer 进行 EncryptTo
+		bufPtr := cryptoBufferPool.Get().(*[]byte)
+		defer cryptoBufferPool.Put(bufPtr)
+		tmpBuf := *bufPtr
 		var eb []byte
 		var err error
-		if c.cm != nil {
-			// Check that the destination buffer has room for the encryption overhead
-			// (nonce 16 bytes + tag 16 bytes = 32 bytes). If not, fall back to
-			// heap-allocated Encrypt to avoid "destination buffer too small".
-			if len(b)+32 <= len(tmpBuf) {
-				eb, err = c.cm.EncryptTo(tmpBuf, b)
-			} else {
-				eb, err = c.cm.Encrypt(b)
-			}
-			if err != nil {
-				return 0, err
-			}
+		// Check that the destination buffer has room for the encryption overhead
+		// (nonce 16 bytes + tag 16 bytes = 32 bytes). If not, fall back to
+		// heap-allocated Encrypt to avoid "destination buffer too small".
+		if len(b)+32 <= len(tmpBuf) {
+			eb, err = c.cm.EncryptTo(tmpBuf, b)
 		} else {
-			eb = b
+			eb, err = c.cm.Encrypt(b)
+		}
+		if err != nil {
+			return 0, err
 		}
 		_, err = c.Conn.Write(eb)
 		return len(b), err
@@ -249,6 +258,9 @@ func (c *CryptoConn) Write(b []byte) (int, error) {
 
 	// Stream mode: Split large data into frames to avoid length overflow (max 65535)
 	// 性能关键：分块加密，避免单帧过大
+	bufPtr := cryptoBufferPool.Get().(*[]byte)
+	defer cryptoBufferPool.Put(bufPtr)
+	tmpBuf := *bufPtr
 	totalWritten := 0
 	for len(b) > 0 {
 		// Calculate max plaintext size for a single frame
