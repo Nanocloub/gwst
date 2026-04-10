@@ -153,6 +153,43 @@
 
 
 # ─────────────────────────────────────────────
+# 端口范围监听
+# ─────────────────────────────────────────────
+# listen_addr 支持端口范围语法 "host:start-end"，会在 [start, end] 每个端口上
+# 各自独立监听，互不影响（等价于在配置文件中写 N 个独立 endpoint）。
+# 三种传输层均支持，支持 IPv4 / IPv6。
+#
+# 格式: "<host>:<startPort>-<endPort>"
+#   <startPort> 和 <endPort> 必须是 1–65535 的整数，且 startPort ≤ endPort
+#   <host> 为空表示监听所有网卡（与 ":port" 相同），支持 IPv4 / IPv6
+
+# 端口范围服务端（TCP，无 TLS）
+- is_client: false
+  listen_addr: ":8010-8019"          # 同时监听 8010–8019 共 10 个端口
+  target_addr: "localhost:80"
+  transport: "tcp"
+  encryption_key: "1234567890123456"
+  encryption_algo: "aegis-128l"
+  tls: false
+
+# 端口范围服务端（WebSocket，带认证）
+- is_client: false
+  listen_addr: ":8020-8029"          # 同时监听 8020–8029 共 10 个端口，每个端口独立
+  target_addr: "localhost:80"
+  path: "/ws"
+  transport: "websocket"
+  key: "my-auth-secret"
+  tls: false
+
+# IPv6 端口范围服务端
+- is_client: false
+  listen_addr: "[::]:8030-8039"      # IPv6 地址同样支持端口范围
+  target_addr: "localhost:80"
+  transport: "tcp"
+  tls: false
+
+
+# ─────────────────────────────────────────────
 # 配置说明
 # ─────────────────────────────────────────────
 #

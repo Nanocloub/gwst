@@ -6,6 +6,7 @@ import (
 	stdlog "log"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -67,6 +68,33 @@ func main() {
 }
 
 func run(endpoint config.Endpoint) {
+	addrs, err := config.ExpandListenAddrs(endpoint.ListenAddr)
+	if err != nil {
+		log.Errorf("Invalid listen_addr %q: %v", endpoint.ListenAddr, err)
+		return
+	}
+
+	if len(addrs) > 1 {
+		// 端口范围：每个端口独立启动，互不影响
+		log.Infof("Port range %s expanded to %d ports", endpoint.ListenAddr, len(addrs))
+		var wg sync.WaitGroup
+		for _, addr := range addrs {
+			ep := endpoint
+			ep.ListenAddr = addr
+			wg.Add(1)
+			go func(ep config.Endpoint) {
+				defer wg.Done()
+				runSingleEndpoint(ep)
+			}(ep)
+		}
+		wg.Wait()
+		return
+	}
+
+	runSingleEndpoint(endpoint)
+}
+
+func runSingleEndpoint(endpoint config.Endpoint) {
 	for {
 		var s server
 

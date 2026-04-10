@@ -2,7 +2,10 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -129,6 +132,43 @@ type Endpoint struct {
 // Endpoints 表示配置文件中的所有端点
 type Endpoints []Endpoint
 
+// ExpandListenAddrs 解析 listenAddr，如果包含端口范围（如 ":8080-8090"），展开为独立地址列表。
+// 若无端口范围，直接返回 []string{listenAddr}。
+// 支持所有合法的 host:port 格式，包括 IPv6（如 "[::]:8080-8090"）。
+func ExpandListenAddrs(listenAddr string) ([]string, error) {
+	host, portStr, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid listen_addr %q: %w", listenAddr, err)
+	}
+
+	dashIdx := strings.IndexByte(portStr, '-')
+	if dashIdx < 0 {
+		// 非端口范围，原样返回
+		return []string{listenAddr}, nil
+	}
+
+	startStr := portStr[:dashIdx]
+	endStr := portStr[dashIdx+1:]
+
+	startPort, err := strconv.Atoi(startStr)
+	if err != nil || startPort < 1 || startPort > 65535 {
+		return nil, fmt.Errorf("invalid port range start %q in listen_addr %q", startStr, listenAddr)
+	}
+	endPort, err := strconv.Atoi(endStr)
+	if err != nil || endPort < 1 || endPort > 65535 {
+		return nil, fmt.Errorf("invalid port range end %q in listen_addr %q", endStr, listenAddr)
+	}
+	if startPort > endPort {
+		return nil, fmt.Errorf("port range start %d > end %d in listen_addr %q", startPort, endPort, listenAddr)
+	}
+
+	addrs := make([]string, 0, endPort-startPort+1)
+	for port := startPort; port <= endPort; port++ {
+		addrs = append(addrs, net.JoinHostPort(host, strconv.Itoa(port)))
+	}
+	return addrs, nil
+}
+
 // LoadFromFile 从 YAML 文件加载配置
 func LoadFromFile(path string) (Endpoints, error) {
 	yamlFile, err := os.ReadFile(path)
@@ -153,6 +193,11 @@ func LoadFromFile(path string) (Endpoints, error) {
 func (e *Endpoint) Validate() error {
 	if e.ListenAddr == "" {
 		return fmt.Errorf("listen_addr is required")
+	}
+
+	// 验证端口范围语法（同时校验 host:port 格式）
+	if _, err := ExpandListenAddrs(e.ListenAddr); err != nil {
+		return err
 	}
 
 	if e.IsClient {
