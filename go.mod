@@ -6,7 +6,7 @@ require (
 	github.com/aegis-aead/go-libaegis v0.2.14
 	github.com/apernet/quic-go v0.59.1-0.20260330051153-c402ee641eb6
 	github.com/panjf2000/ants/v2 v2.11.3
-	github.com/refraction-networking/utls v1.8.0
+	github.com/refraction-networking/utls v1.8.1
 	github.com/sirupsen/logrus v1.9.3
 	github.com/zijiren233/gencontainer v0.0.0-20250117072502-9e882446f52f
 	golang.org/x/exp v0.0.0-20250819193227-8b4c13bb791b
